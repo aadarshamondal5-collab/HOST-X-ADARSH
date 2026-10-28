@@ -72,6 +72,8 @@ bot_scripts = {}
 user_subscriptions = {}
 user_files = {}
 user_favorites = {}
+user_credits = {}            # [CREDIT]
+pending_credit_action = {}   # [CREDIT]  {admin_id: {'action':'add'|'deduct', 'step':'await_id'|'await_amt', 'target_id': int|None}}
 banned_users = set()
 active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
@@ -101,6 +103,10 @@ def migrate_db():
             logger.info("Adding last_active column to active_users table...")
             c.execute('ALTER TABLE active_users ADD COLUMN last_active TEXT')
             logger.info("last_active column added successfully.")
+
+        # [CREDIT] ensure credits table exists
+        c.execute('''CREATE TABLE IF NOT EXISTS credits
+                     (user_id INTEGER PRIMARY KEY, credits INTEGER NOT NULL DEFAULT 0)''')
         
         conn.commit()
         conn.close()
@@ -128,6 +134,9 @@ def init_db():
                      (user_id INTEGER, file_name TEXT, PRIMARY KEY (user_id, file_name))''')
         c.execute('''CREATE TABLE IF NOT EXISTS bot_stats
                      (stat_name TEXT PRIMARY KEY, stat_value INTEGER)''')
+        # [CREDIT]
+        c.execute('''CREATE TABLE IF NOT EXISTS credits
+                     (user_id INTEGER PRIMARY KEY, credits INTEGER NOT NULL DEFAULT 0)''')
         
         c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
         if ADMIN_ID != OWNER_ID:
@@ -180,6 +189,11 @@ def load_data():
         for stat_name, stat_value in c.fetchall():
             bot_stats[stat_name] = stat_value
         
+        # [CREDIT] load credits
+        c.execute('SELECT user_id, credits FROM credits')
+        for user_id, credits in c.fetchall():
+            user_credits[user_id] = credits
+        
         conn.close()
         logger.info(f"Data loaded: {len(active_users)} users, {len(banned_users)} banned, {len(admin_ids)} admins.")
     except Exception as e:
@@ -189,8 +203,33 @@ init_db()
 migrate_db()
 load_data()
 
+# [CREDIT] credit helpers
+def get_user_credits(user_id):
+    return user_credits.get(user_id, 0)
+
+def set_user_credits(user_id, amount):
+    amount = max(0, int(amount))
+    user_credits[user_id] = amount
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO credits (user_id, credits) VALUES (?, ?)', (user_id, amount))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error saving credits for {user_id}: {e}")
+
+def add_user_credits(user_id, amount):
+    new_val = get_user_credits(user_id) + int(amount)
+    set_user_credits(user_id, new_val)
+    return new_val
+
+def deduct_user_credits(user_id, amount):
+    new_val = max(0, get_user_credits(user_id) - int(amount))
+    set_user_credits(user_id, new_val)
+    return new_val
+
 # ── AUTO DEPENDENCY INSTALLER ────────────────────────
-# Import name → actual pip package name (jab dono alag hote hain)
 IMPORT_TO_PIP = {
     'telebot': 'pyTelegramBotAPI',
     'telegram': 'python-telegram-bot',
@@ -213,7 +252,6 @@ IMPORT_TO_PIP = {
     'serial': 'pyserial',
 }
 
-# Python built-in modules — inhe kabhi install karne ki koshish nahi karni
 STDLIB_MODULES = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_names') else {
     'os', 'sys', 'time', 'json', 're', 'math', 'random', 'datetime', 'collections',
     'itertools', 'functools', 'subprocess', 'threading', 'asyncio', 'socket', 'io',
@@ -223,7 +261,6 @@ STDLIB_MODULES = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_nam
 }
 
 def extract_imports(file_path):
-    """File ke andar se saare top-level 'import X' / 'from X import Y' nikalta hai"""
     modules = set()
     try:
         content = Path(file_path).read_text(errors='ignore')
@@ -235,17 +272,13 @@ def extract_imports(file_path):
     return modules
 
 def install_missing_dependencies(file_path, timeout=90):
-    """Script mein use ho rahi libraries check karke jo missing hain unhe pip se install karta hai.
-    Returns: (installed_list, failed_list)"""
     modules = extract_imports(file_path)
     installed, failed = [], []
-
     for mod in modules:
         if mod in STDLIB_MODULES or mod in ('__future__',):
             continue
         if importlib.util.find_spec(mod) is not None:
-            continue  # already installed
-
+            continue
         pip_name = IMPORT_TO_PIP.get(mod, mod)
         try:
             result = subprocess.run(
@@ -259,11 +292,10 @@ def install_missing_dependencies(file_path, timeout=90):
         except Exception as e:
             logger.error(f"pip install error for {pip_name}: {e}")
             failed.append(pip_name)
-
     return installed, failed
 
 def get_user_file_limit(user_id):
-    return OWNER_LIMIT  # Sabke liye unlimited — koi upload limit nahi
+    return OWNER_LIMIT
 
 def format_limit(limit):
     return "Unlimited ♾️" if limit == float('inf') else f"{limit} files"
@@ -296,12 +328,17 @@ def get_admin_panel_keyboard():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏱️ Bot Uptime", callback_data="admin_bot_uptime")],
         [InlineKeyboardButton(text="👥 Total Users", callback_data="admin_total_users_simple")],
+        # [CREDIT] new admin buttons
+        [InlineKeyboardButton(text="💰 Add Credit", callback_data="admin_add_credit")],
+        [InlineKeyboardButton(text="💸 Deduct Credit", callback_data="admin_deduct_credit")],
         [InlineKeyboardButton(text="📝 Logs", callback_data="admin_view_logs")],
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
     ])
     return keyboard
 
 def build_welcome_text(user_id: int, full_name: str) -> str:
+    # [CREDIT] show credits
+    credits = get_user_credits(user_id)
     return f"""╔═══════════════════════╗
     🚀 <b>TEAM X HOSTBOT</b> 🚀
     ⚡ <i>Script Runner Bot</i>
@@ -310,7 +347,8 @@ def build_welcome_text(user_id: int, full_name: str) -> str:
 👋 <b>Welcome, {full_name}!</b>
 
 🆔 <b>Your ID:</b> <code>{user_id}</code>
-📦 <b>Upload Limit:</b> Unlimited ♾️
+💳 <b>Credits:</b> {credits}
+📦 <b>Upload Limit:</b> Unlimited ♾️ (needs credits)
 
 ━━━━━━━━━━━━━━━━━━━━
 <b>🔥 AVAILABLE FEATURES</b>
@@ -330,7 +368,7 @@ def build_welcome_text(user_id: int, full_name: str) -> str:
 🎥 <b>YouTube:</b> {YOUTUBE_CHANNEL}
 
 ⚡ <b>Developed by</b> Adarsha (Team X)
-🔒 <b>Version:</b> 2.0"""
+🔒 <b>Version:</b> 2.1"""
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -341,6 +379,10 @@ async def cmd_start(message: types.Message):
         return
     
     active_users.add(user_id)
+
+    # [CREDIT] ensure credits row exists (new users start at 0)
+    if user_id not in user_credits:
+        set_user_credits(user_id, 0)
     
     try:
         conn = sqlite3.connect(DATABASE_PATH)
@@ -360,7 +402,6 @@ async def cmd_start(message: types.Message):
 @dp.callback_query(F.data == "back_to_main")
 async def callback_back_to_main(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    
     welcome_text = f"""
 ╔═══════════════════════╗
     🏠 <b>MAIN MENU</b> 🏠
@@ -368,6 +409,7 @@ async def callback_back_to_main(callback: types.CallbackQuery):
 
 👤 <b>User:</b> {callback.from_user.full_name}
 🆔 <b>ID:</b> <code>{user_id}</code>
+💳 <b>Credits:</b> {get_user_credits(user_id)}
 📦 <b>Files:</b> {len(user_files.get(user_id, []))} (Unlimited ♾️)
 
 Use buttons below to navigate 👇
@@ -385,13 +427,15 @@ async def callback_upload_file(callback: types.CallbackQuery):
     
     current_files = len(user_files.get(user_id, []))
     limit = get_user_file_limit(user_id)
-    
+    credits = get_user_credits(user_id)   # [CREDIT]
+
     upload_text = f"""
 ╔═══════════════════════╗
     📤 <b>UPLOAD FILES</b> 📤
 ╚═══════════════════════╝
 
 📊 <b>Current Usage:</b> {current_files} files (Unlimited ♾️)
+💳 <b>Your Credits:</b> {credits}
 
 📝 <b>Supported Formats:</b>
 🐍 Python (.py)
@@ -404,9 +448,9 @@ async def callback_upload_file(callback: types.CallbackQuery):
 1️⃣ Send your file to the bot
 2️⃣ Wait for upload confirmation
 3️⃣ File will be saved automatically
+⚡ Each upload costs <b>1 credit</b>
 
-⚡ <b>Upload limit:</b> {limit} files
-🔥 <b>Quick & Easy!</b>
+🔥 <b>Quick &amp; Easy!</b>
 """
     
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -446,10 +490,8 @@ Upload your first file to get started! 🚀
         for i, (file_name, file_type) in enumerate(files, 1):
             icon = "🐍" if file_type == "py" else "🟨" if file_type == "js" else "📦"
             text += f"{i}. {icon} <code>{file_name}</code>\n"
-            
             is_favorite = file_name in user_favorites.get(user_id, [])
             star = "⭐" if is_favorite else "☆"
-            
             buttons.append([
                 InlineKeyboardButton(text=f"▶️ Run {file_name[:15]}", callback_data=f"run_script:{file_name}"),
                 InlineKeyboardButton(text=f"{star}", callback_data=f"toggle_fav:{file_name}")
@@ -458,7 +500,6 @@ Upload your first file to get started! 🚀
                 InlineKeyboardButton(text=f"ℹ️ Info {file_name[:15]}", callback_data=f"file_info:{file_name}"),
                 InlineKeyboardButton(text=f"🗑️ Delete", callback_data=f"delete_file:{file_name}")
             ])
-        
         buttons.append([InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")])
         back_keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
@@ -495,7 +536,6 @@ Add files to favorites for quick access! 🚀
                 InlineKeyboardButton(text=f"▶️ {file_name[:20]}", callback_data=f"run_script:{file_name}"),
                 InlineKeyboardButton(text=f"❌", callback_data=f"toggle_fav:{file_name}")
             ])
-        
         buttons.append([InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")])
     
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -528,7 +568,6 @@ To search, use:
         [InlineKeyboardButton(text="📁 View All Files", callback_data="check_files")],
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -569,17 +608,14 @@ async def callback_bot_speed(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="🔄 Test Again", callback_data="bot_speed"),
          InlineKeyboardButton(text="🏠 Home", callback_data="back_to_main")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
 
 @dp.callback_query(F.data == "statistics")
 async def callback_statistics(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    
     user_file_count = len(user_files.get(user_id, []))
     user_fav_count = len(user_favorites.get(user_id, []))
-    limit = get_user_file_limit(user_id)
-    is_premium = user_id in user_subscriptions
+    credits = get_user_credits(user_id)   # [CREDIT]
     
     text = f"""
 ╔═══════════════════════╗
@@ -588,6 +624,7 @@ async def callback_statistics(callback: types.CallbackQuery):
 
 👤 <b>User:</b> {callback.from_user.full_name}
 🆔 <b>ID:</b> <code>{user_id}</code>
+💳 <b>Credits:</b> {credits}
 
 ━━━━━━━━━━━━━━━━━━━━
 📦 <b>FILE STATISTICS:</b>
@@ -615,7 +652,6 @@ async def callback_statistics(callback: types.CallbackQuery):
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -632,6 +668,7 @@ async def callback_help_info(callback: types.CallbackQuery):
    • Click 'Upload File'
    • Send your .py, .js, or .zip file
    • File will be saved automatically
+   • ⚡ Costs 1 credit per upload
 
 2️⃣ <b>Run Scripts:</b>
    • Go to 'My Files'
@@ -654,16 +691,13 @@ async def callback_help_info(callback: types.CallbackQuery):
 /help - Show this help
 /search - Search files
 /stats - Your statistics
-/premium - Free info
 
 <b>Need help? Contact owner! 💬</b>
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎯 Features", callback_data="all_features")],
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -689,19 +723,17 @@ async def callback_all_features(callback: types.CallbackQuery):
 11. 💾 View File Information
 12. ℹ️ Help & Support
 13. 🎯 Feature Discovery
+14. 💳 Credit System (contact admin for credits)
 
 ━━━━━━━━━━━━━━━━━━━━
 <b>🆓 SAB KUCH FREE HAI!</b>
 
-• Unlimited file uploads
-• Koi premium plan nahi
-• Sabke liye same features
+• Unlimited file uploads (1 credit each)
+• Contact admin to get credits added
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -713,8 +745,9 @@ async def callback_get_premium(callback: types.CallbackQuery):
 ╚═══════════════════════╝
 
 Is bot mein <b>koi premium plan nahi</b> hai.
-✅ Unlimited uploads
-✅ Saare features sabke liye free
+
+💳 Upload ke liye <b>credits</b> chahiye.
+Admin se contact karke credits le sakte ho.
 
 Help chahiye? Owner se contact karo 💬
 """
@@ -728,11 +761,9 @@ Help chahiye? Owner se contact karo 💬
 @dp.callback_query(F.data == "admin_panel")
 async def callback_admin_panel(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    
     if user_id not in admin_ids:
         await callback.answer("❌ Admin access required!", show_alert=True)
         return
-    
     text = """
 ╔═══════════════════════╗
     👑 <b>ADMIN PANEL</b> 👑
@@ -740,9 +771,145 @@ async def callback_admin_panel(callback: types.CallbackQuery):
 
 Select an option below 👇
 """
-    
     await callback.message.edit_text(text, reply_markup=get_admin_panel_keyboard(), parse_mode="HTML")
     await callback.answer()
+
+# [CREDIT] ADD CREDIT handler
+@dp.callback_query(F.data == "admin_add_credit")
+async def callback_admin_add_credit(callback: types.CallbackQuery):
+    if callback.from_user.id not in admin_ids:
+        await callback.answer("❌ Admin only!", show_alert=True)
+        return
+
+    pending_credit_action[callback.from_user.id] = {'action': 'add', 'step': 'await_id', 'target_id': None}
+    text = """╔═══════════════════════╗
+    💰 <b>ADD CREDIT</b> 💰
+╚═══════════════════════╝
+
+Please send the <b>User ID</b> to add credits to.
+
+Example: <code>123456789</code>
+
+Type /cancel to abort."""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="admin_panel")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+# [CREDIT] DEDUCT CREDIT handler
+@dp.callback_query(F.data == "admin_deduct_credit")
+async def callback_admin_deduct_credit(callback: types.CallbackQuery):
+    if callback.from_user.id not in admin_ids:
+        await callback.answer("❌ Admin only!", show_alert=True)
+        return
+
+    pending_credit_action[callback.from_user.id] = {'action': 'deduct', 'step': 'await_id', 'target_id': None}
+    text = """╔═══════════════════════╗
+    💸 <b>DEDUCT CREDIT</b> 💸
+╚═══════════════════════╝
+
+Please send the <b>User ID</b> to deduct credits from.
+
+Example: <code>123456789</code>
+
+Type /cancel to abort."""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="admin_panel")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+# [CREDIT] cancel pending flow
+@dp.message(Command("cancel"))
+async def cmd_cancel_credit(message: types.Message):
+    if message.from_user.id in pending_credit_action:
+        del pending_credit_action[message.from_user.id]
+        await message.answer("✅ Cancelled.", reply_markup=get_main_keyboard(message.from_user.id))
+    else:
+        await message.answer("Nothing to cancel.")
+
+# [CREDIT] multi-step credit flow — registered LAST so it only catches fallback
+@dp.message()
+async def credit_flow_handler(message: types.Message):
+    admin_id = message.from_user.id
+    if admin_id not in pending_credit_action:
+        return
+    if admin_id not in admin_ids:
+        pending_credit_action.pop(admin_id, None)
+        return
+    if not message.text:
+        return
+
+    text = message.text.strip()
+
+    if text.lower() in ('/cancel', 'cancel'):
+        pending_credit_action.pop(admin_id, None)
+        await message.answer("✅ Cancelled.", reply_markup=get_main_keyboard(admin_id))
+        return
+
+    if text.startswith('/'):
+        return
+
+    state = pending_credit_action[admin_id]
+
+    if state['step'] == 'await_id':
+        if not text.isdigit():
+            await message.answer("❌ Invalid User ID. Please send a numeric Telegram user ID.")
+            return
+        target_id = int(text)
+        state['target_id'] = target_id
+        state['step'] = 'await_amt'
+        pending_credit_action[admin_id] = state
+        current = get_user_credits(target_id)
+        verb = "add to" if state['action'] == 'add' else "deduct from"
+        await message.answer(
+            f"👤 Target User: <code>{target_id}</code>\n"
+            f"💳 Current Credits: <b>{current}</b>\n\n"
+            f"How many credits to <b>{verb}</b> this user?\n"
+            f"Send a number. Type /cancel to abort.",
+            parse_mode="HTML"
+        )
+        return
+
+    if state['step'] == 'await_amt':
+        if not text.isdigit() or int(text) <= 0:
+            await message.answer("❌ Please send a positive whole number.")
+            return
+        amount = int(text)
+        target_id = state['target_id']
+
+        if state['action'] == 'add':
+            new_val = add_user_credits(target_id, amount)
+            verb = "Added"
+            symbol = "➕"
+        else:
+            new_val = deduct_user_credits(target_id, amount)
+            verb = "Deducted"
+            symbol = "➖"
+
+        pending_credit_action.pop(admin_id, None)
+
+        try:
+            await bot.send_message(
+                target_id,
+                f"{symbol} <b>Credits Updated</b>\n\n"
+                f"{verb}: <b>{amount}</b>\n"
+                f"💳 New Balance: <b>{new_val}</b>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+        await message.answer(
+            f"✅ <b>Done!</b>\n\n"
+            f"👤 User: <code>{target_id}</code>\n"
+            f"{symbol} {verb}: <b>{amount}</b>\n"
+            f"💳 New Balance: <b>{new_val}</b>",
+            reply_markup=get_main_keyboard(admin_id),
+            parse_mode="HTML"
+        )
+        return
 
 @dp.callback_query(F.data == "admin_bot_uptime")
 async def callback_admin_bot_uptime(callback: types.CallbackQuery):
@@ -750,12 +917,10 @@ async def callback_admin_bot_uptime(callback: types.CallbackQuery):
     if user_id not in admin_ids:
         await callback.answer("❌ Admin access required!", show_alert=True)
         return
-
     delta = datetime.now() - BOT_START_TIME
     days = delta.days
     hours, rem = divmod(delta.seconds, 3600)
     minutes, seconds = divmod(rem, 60)
-
     text = f"""╔═══════════════════════╗
     ⏱️ <b>BOT UPTIME</b> ⏱️
 ╚═══════════════════════╝
@@ -763,7 +928,6 @@ async def callback_admin_bot_uptime(callback: types.CallbackQuery):
 🟢 <b>Status:</b> Running
 📅 <b>Started:</b> {BOT_START_TIME.strftime('%d %b %Y, %I:%M %p')}
 ⏳ <b>Uptime:</b> {days}d {hours}h {minutes}m {seconds}s"""
-
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Back", callback_data="admin_panel")]
     ])
@@ -776,17 +940,14 @@ async def callback_admin_total_users_simple(callback: types.CallbackQuery):
     if user_id not in admin_ids:
         await callback.answer("❌ Admin access required!", show_alert=True)
         return
-
     total_users = len(active_users)
     total_active_scripts = len(bot_scripts)
-
     text = f"""╔═══════════════════════╗
     👥 <b>TOTAL USERS</b> 👥
 ╚═══════════════════════╝
 
 👤 <b>Total Users:</b> {total_users}
 ▶️ <b>Currently Running Scripts:</b> {total_active_scripts}"""
-
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Back", callback_data="admin_panel")]
     ])
@@ -816,9 +977,7 @@ async def callback_toggle_favorite(callback: types.CallbackQuery):
         
         conn.commit()
         conn.close()
-        
         await callback_check_files(callback)
-        
     except Exception as e:
         logger.error(f"Error toggling favorite: {e}")
         await callback.answer(f"❌ Error: {str(e)}", show_alert=True)
@@ -827,7 +986,6 @@ async def callback_toggle_favorite(callback: types.CallbackQuery):
 async def callback_file_info(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     file_name = callback.data.split(":", 1)[1]
-    
     user_folder = UPLOAD_BOTS_DIR / str(user_id)
     file_path = user_folder / file_name
     
@@ -839,7 +997,6 @@ async def callback_file_info(callback: types.CallbackQuery):
     file_size_mb = file_size / (1024 * 1024)
     file_ext = file_path.suffix
     modified_time = datetime.fromtimestamp(file_path.stat().st_mtime)
-    
     is_favorite = file_name in user_favorites.get(user_id, [])
     
     text = f"""
@@ -856,14 +1013,12 @@ async def callback_file_info(callback: types.CallbackQuery):
 
 🔐 <b>MD5:</b> <code>{hashlib.md5(file_path.read_bytes()).hexdigest()[:16]}...</code>
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Run", callback_data=f"run_script:{file_name}"),
          InlineKeyboardButton(text="🗑️ Delete", callback_data=f"delete_file:{file_name}")],
         [InlineKeyboardButton(text="📁 My Files", callback_data="check_files"),
          InlineKeyboardButton(text="🏠 Home", callback_data="back_to_main")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -886,6 +1041,18 @@ async def handle_document(message: types.Message):
     if file_ext not in ['.py', '.js', '.zip']:
         await message.answer("❌ Only .py, .js, and .zip files are supported!")
         return
+
+    # [CREDIT] must have at least 1 credit (admins exempt)
+    credits = get_user_credits(user_id)
+    if credits <= 0 and user_id not in admin_ids:
+        await message.answer(
+            "❌ <b>Insufficient credits!</b>\n\n"
+            f"💳 Your credits: <b>{credits}</b>\n\n"
+            "You need at least <b>1 credit</b> to upload a file.\n"
+            "Contact an admin to get credits added.",
+            parse_mode="HTML"
+        )
+        return
     
     current_files = len(user_files.get(user_id, []))
     limit = get_user_file_limit(user_id)
@@ -896,7 +1063,6 @@ async def handle_document(message: types.Message):
     
     user_folder = UPLOAD_BOTS_DIR / str(user_id)
     user_folder.mkdir(exist_ok=True)
-    
     file_path = user_folder / file_name
     
     try:
@@ -944,6 +1110,10 @@ async def handle_document(message: types.Message):
         conn.close()
         
         bot_stats['total_uploads'] = bot_stats.get('total_uploads', 0) + 1
+
+        # [CREDIT] deduct 1 credit after successful upload (admins exempt)
+        if user_id not in admin_ids:
+            deduct_user_credits(user_id, 1)
         
         await status_msg.edit_text(
             f"✅ <b>Finalizing...</b>\n\n"
@@ -974,6 +1144,8 @@ async def handle_document(message: types.Message):
                  InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
             ])
         
+        # [CREDIT] show new balance in success message
+        new_credits = get_user_credits(user_id)
         await status_msg.edit_text(
             f"""
 ╔═══════════════════════╗
@@ -984,6 +1156,7 @@ async def handle_document(message: types.Message):
 📦 <b>Type:</b> {file_ext[1:].upper()}
 💾 <b>Size:</b> {document.file_size / 1024:.2f} KB
 📊 <b>Usage:</b> {current_files + 1} files (Unlimited ♾️)
+💳 <b>Credits Left:</b> {new_credits}
 
 🎉 File uploaded successfully!
 """,
@@ -1030,7 +1203,6 @@ async def callback_run_script(callback: types.CallbackQuery):
                 await status_msg.delete()
             except Exception:
                 pass
-
             process = subprocess.Popen(
                 [sys.executable, str(file_path)],
                 cwd=str(user_folder),
@@ -1077,9 +1249,7 @@ async def callback_run_script(callback: types.CallbackQuery):
             [InlineKeyboardButton(text="📁 My Files", callback_data="check_files"),
              InlineKeyboardButton(text="🏠 Home", callback_data="back_to_main")]
         ])
-        
         await callback.message.edit_reply_markup(reply_markup=keyboard)
-        
     except Exception as e:
         logger.error(f"Error running script: {e}")
         await callback.answer(f"❌ Error: {str(e)}", show_alert=True)
@@ -1114,7 +1284,6 @@ async def callback_view_log(callback: types.CallbackQuery):
 {running_note}
 
 <pre>{content}</pre>"""
-
         back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Refresh", callback_data=f"view_log:{file_name}")],
             [InlineKeyboardButton(text="📁 My Files", callback_data="check_files")]
@@ -1127,36 +1296,26 @@ async def callback_view_log(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("stop_script:"))
 async def callback_stop_script(callback: types.CallbackQuery):
     script_key = callback.data.split(":", 1)[1]
-    
     if script_key not in bot_scripts:
         await callback.answer("❌ Script not found or already stopped!", show_alert=True)
         return
-    
     try:
         script_info = bot_scripts[script_key]
         process = script_info['process']
         log_file = script_info.get('log_file')
-        
         if log_file and not log_file.closed:
             log_file.close()
-        
         parent = psutil.Process(process.pid)
         children = parent.children(recursive=True)
-        
         for child in children:
             child.terminate()
-        
         parent.terminate()
-        
         del bot_scripts[script_key]
-        
         await callback.answer("✅ Script stopped successfully!", show_alert=True)
-        
         if callback.from_user.id in admin_ids:
             await callback.message.edit_text("🛑 Script stopped!", parse_mode="HTML")
         else:
             await callback_back_to_main(callback)
-        
     except Exception as e:
         logger.error(f"Error stopping script: {e}")
         await callback.answer(f"❌ Error: {str(e)}", show_alert=True)
@@ -1165,18 +1324,14 @@ async def callback_stop_script(callback: types.CallbackQuery):
 async def callback_extract_zip(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     file_name = callback.data.split(":", 1)[1]
-    
     user_folder = UPLOAD_BOTS_DIR / str(user_id)
     zip_path = user_folder / file_name
-    
     if not zip_path.exists():
         await callback.answer("❌ ZIP file not found!", show_alert=True)
         return
-    
     if not zipfile.is_zipfile(zip_path):
         await callback.answer("❌ Invalid ZIP file!", show_alert=True)
         return
-    
     try:
         status_text = f"""
 ╔═══════════════════════╗
@@ -1189,28 +1344,20 @@ async def callback_extract_zip(callback: types.CallbackQuery):
 Please wait...
 """
         await callback.message.edit_text(status_text, parse_mode="HTML")
-        
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(user_folder)
             all_files = zip_ref.namelist()
-        
         registered_files = []
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         now = datetime.now().isoformat()
-        
         for extracted_file in all_files:
             if extracted_file.endswith('/'):
                 continue
-            
             file_path = Path(extracted_file)
             file_ext = file_path.suffix.lower()
-            
             if file_ext in ['.py', '.js']:
                 just_name = file_path.name
-                
-                # Agar file kisi subfolder mein extract hui hai, use root user_folder mein move karo
-                # taaki baad mein run karte waqt file mil jaye (registration sirf naam track karta hai)
                 extracted_full_path = user_folder / extracted_file
                 target_path = user_folder / just_name
                 if extracted_full_path.exists() and extracted_full_path != target_path:
@@ -1218,7 +1365,6 @@ Please wait...
                         extracted_full_path.rename(target_path)
                         just_name = target_path.name
                     else:
-                        # Naam already exist karta hai to unique bana do (overwrite se bachne ke liye)
                         stem, suf = target_path.stem, target_path.suffix
                         counter = 1
                         new_target = user_folder / f"{stem}_{counter}{suf}"
@@ -1227,37 +1373,27 @@ Please wait...
                             new_target = user_folder / f"{stem}_{counter}{suf}"
                         extracted_full_path.rename(new_target)
                         just_name = new_target.name
-                
                 if user_id not in user_files:
                     user_files[user_id] = []
-                
                 user_files[user_id].append((just_name, file_ext[1:]))
-                
                 c.execute('INSERT OR REPLACE INTO user_files (user_id, file_name, file_type, upload_date) VALUES (?, ?, ?, ?)',
                           (user_id, just_name, file_ext[1:], now))
-                
                 registered_files.append(just_name)
-        
         if user_id in user_files:
             user_files[user_id] = [f for f in user_files[user_id] if f[0] != file_name]
-        
         c.execute('DELETE FROM user_files WHERE user_id = ? AND file_name = ?', (user_id, file_name))
         c.execute('DELETE FROM favorites WHERE user_id = ? AND file_name = ?', (user_id, file_name))
         conn.commit()
         conn.close()
-        
         if zip_path.exists():
             zip_path.unlink()
-        
         registered_text = "\n".join([f"  • <code>{f}</code>" for f in registered_files[:10]])
         if len(registered_files) > 10:
             registered_text += f"\n  ... and {len(registered_files) - 10} more files"
         elif len(registered_files) == 0:
             registered_text = "  <i>No .py or .js files found</i>"
-        
         current_count = len(user_files.get(user_id, []))
         limit = get_user_file_limit(user_id)
-        
         success_text = f"""
 ╔═══════════════════════╗
     ✅ <b>EXTRACTION SUCCESS!</b> ✅
@@ -1275,15 +1411,12 @@ Please wait...
 
 ✨ Extraction completed successfully!
 """
-        
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📁 My Files", callback_data="check_files"),
              InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
         ])
-        
         await callback.message.edit_text(success_text, reply_markup=keyboard, parse_mode="HTML")
         await callback.answer("✅ ZIP extracted & registered!")
-        
     except zipfile.BadZipFile:
         await callback.answer("❌ Corrupted ZIP file!", show_alert=True)
     except Exception as e:
@@ -1294,30 +1427,23 @@ Please wait...
 async def callback_delete_file(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     file_name = callback.data.split(":", 1)[1]
-    
     user_folder = UPLOAD_BOTS_DIR / str(user_id)
     file_path = user_folder / file_name
-    
     try:
         if file_path.exists():
             file_path.unlink()
-        
         if user_id in user_files:
             user_files[user_id] = [f for f in user_files[user_id] if f[0] != file_name]
-        
         if file_name in user_favorites.get(user_id, []):
             user_favorites[user_id].remove(file_name)
-        
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         c.execute('DELETE FROM user_files WHERE user_id = ? AND file_name = ?', (user_id, file_name))
         c.execute('DELETE FROM favorites WHERE user_id = ? AND file_name = ?', (user_id, file_name))
         conn.commit()
         conn.close()
-        
         await callback.answer("✅ File deleted successfully!", show_alert=True)
         await callback_check_files(callback)
-        
     except Exception as e:
         logger.error(f"Error deleting file: {e}")
         await callback.answer(f"❌ Error: {str(e)}", show_alert=True)
@@ -1327,7 +1453,6 @@ async def callback_admin_total_users(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     user_list = "\n".join([f"• <code>{uid}</code>" for uid in list(active_users)[:15]])
     text = f"""
 ╔═══════════════════════╗
@@ -1343,11 +1468,9 @@ async def callback_admin_total_users(callback: types.CallbackQuery):
 
 {'...' if len(active_users) > 15 else ''}
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1356,12 +1479,10 @@ async def callback_admin_total_files(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     total_files = sum(len(files) for files in user_files.values())
     py_files = sum(1 for files in user_files.values() for f in files if f[1] == 'py')
     js_files = sum(1 for files in user_files.values() for f in files if f[1] == 'js')
     zip_files = sum(1 for files in user_files.values() for f in files if f[1] == 'zip')
-    
     text = f"""
 ╔═══════════════════════╗
     📁 <b>FILE STATISTICS</b> 📁
@@ -1376,15 +1497,12 @@ async def callback_admin_total_files(callback: types.CallbackQuery):
 
 <b>📈 Top Users:</b>
 """
-    
     top_users = sorted(user_files.items(), key=lambda x: len(x[1]), reverse=True)[:5]
     for user_id, files in top_users:
         text += f"• User <code>{user_id}</code>: {len(files)} files\n"
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1393,7 +1511,6 @@ async def callback_admin_running_scripts(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     if not bot_scripts:
         text = """
 ╔═══════════════════════╗
@@ -1420,10 +1537,8 @@ async def callback_admin_running_scripts(callback: types.CallbackQuery):
                 text=f"🛑 Stop {info['file_name'][:15]}", 
                 callback_data=f"stop_script:{script_key}"
             )])
-    
     buttons.append([InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")])
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1432,9 +1547,7 @@ async def callback_admin_premium_users(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     premium_users = [(u, data) for u, data in user_subscriptions.items() if data['expiry'] > datetime.now()]
-    
     if not premium_users:
         text = """
 ╔═══════════════════════╗
@@ -1453,12 +1566,10 @@ No active premium subscriptions.
         for user_id, data in premium_users:
             expiry_date = data['expiry'].strftime('%Y-%m-%d')
             text += f"💎 User <code>{user_id}</code>\n   Expires: {expiry_date}\n\n"
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Add Premium", callback_data="add_premium")],
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1467,7 +1578,6 @@ async def callback_admin_analytics(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     text = f"""
 ╔═══════════════════════╗
     📊 <b>BOT ANALYTICS</b> 📊
@@ -1492,11 +1602,9 @@ Banned Users: {len(banned_users)}
 Admins: {len(admin_ids)}
 Bot Status: {'🔒 Locked' if bot_locked else '✅ Active'}
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1505,11 +1613,9 @@ async def callback_admin_system_status(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     cpu = psutil.cpu_percent(interval=1)
     memory = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
-    
     text = f"""
 ╔═══════════════════════╗
     ⚙️ <b>SYSTEM STATUS</b> ⚙️
@@ -1534,12 +1640,10 @@ Status: {'🔒 Locked' if bot_locked else '✅ Running'}
 Scripts: {len(bot_scripts)} active
 Uptime: ✅ Online
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Refresh", callback_data="admin_system_status")],
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1548,7 +1652,6 @@ async def callback_admin_add_admin(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     text = """
 ╔═══════════════════════╗
     ➕ <b>ADD ADMIN</b> ➕
@@ -1562,11 +1665,9 @@ To add a new admin, use:
 
 The user will get full admin privileges!
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1575,7 +1676,6 @@ async def callback_admin_remove_admin(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     text = f"""
 ╔═══════════════════════╗
     ➖ <b>REMOVE ADMIN</b> ➖
@@ -1584,16 +1684,12 @@ async def callback_admin_remove_admin(callback: types.CallbackQuery):
 <b>Current Admins ({len(admin_ids)}):</b>
 
 """
-    
     for admin_id in admin_ids:
         text += f"👑 <code>{admin_id}</code>\n"
-    
     text += "\n<b>To remove:</b>\n<code>/removeadmin USER_ID</code>"
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1602,7 +1698,6 @@ async def callback_admin_ban_user(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     text = f"""
 ╔═══════════════════════╗
     🚫 <b>BAN USER</b> 🚫
@@ -1618,11 +1713,9 @@ To ban a user, use:
 
 Banned users cannot use the bot!
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1631,7 +1724,6 @@ async def callback_admin_unban_user(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     text = f"""
 ╔═══════════════════════╗
     ✅ <b>UNBAN USER</b> ✅
@@ -1640,32 +1732,25 @@ async def callback_admin_unban_user(callback: types.CallbackQuery):
 <b>Banned Users:</b> {len(banned_users)}
 
 """
-    
     if banned_users:
         text += "<b>List:</b>\n"
         for ban_id in list(banned_users)[:10]:
             text += f"🚫 <code>{ban_id}</code>\n"
-    
     text += "\n<b>To unban:</b>\n<code>/unban USER_ID</code>"
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data == "lock_bot")
 async def callback_lock_bot(callback: types.CallbackQuery):
     global bot_locked
-    
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     bot_locked = not bot_locked
     status = "🔒 LOCKED" if bot_locked else "🔓 UNLOCKED"
-    
     await callback.answer(f"Bot is now {status}!", show_alert=True)
     await callback_admin_panel(callback)
 
@@ -1674,7 +1759,6 @@ async def callback_broadcast(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     text = f"""
 ╔═══════════════════════╗
     📢 <b>BROADCAST</b> 📢
@@ -1689,11 +1773,9 @@ Send a message to all users!
 
 ⚠️ Use this feature responsibly!
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1702,7 +1784,6 @@ async def callback_add_premium(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     text = """
 ╔═══════════════════════╗
     💎 <b>ADD PREMIUM</b> 💎
@@ -1716,17 +1797,10 @@ Give premium access to users!
 <b>Examples:</b>
 <code>/addpremium 123456789 30</code> (30 days)
 <code>/addpremium 987654321 7</code> (7 days)
-
-Premium benefits:
-• 50 file limit (vs 20)
-• Priority support
-• Premium badge
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1735,7 +1809,6 @@ async def callback_admin_clean_files(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     text = """
 ╔═══════════════════════╗
     🗑️ <b>CLEAN FILES</b> 🗑️
@@ -1753,11 +1826,9 @@ Clean old or unused files from the system.
 
 ⚠️ This action cannot be undone!
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1766,26 +1837,20 @@ async def callback_admin_backup_db(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     try:
         backup_path = IROTECH_DIR / f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        
         conn = sqlite3.connect(DATABASE_PATH)
         backup_conn = sqlite3.connect(backup_path)
         conn.backup(backup_conn)
         backup_conn.close()
         conn.close()
-        
         await callback.answer("✅ Database backed up!", show_alert=True)
-        
         await callback.message.answer_document(
             FSInputFile(backup_path),
             caption="💾 <b>Database Backup</b>\n\nCreated: " + datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             parse_mode="HTML"
         )
-        
         backup_path.unlink()
-        
     except Exception as e:
         logger.error(f"Backup error: {e}")
         await callback.answer(f"❌ Backup failed: {str(e)}", show_alert=True)
@@ -1795,7 +1860,6 @@ async def callback_admin_view_logs(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
         await callback.answer("❌ Admin only!", show_alert=True)
         return
-    
     text = """
 ╔═══════════════════════╗
     📝 <b>SYSTEM LOGS</b> 📝
@@ -1811,11 +1875,9 @@ View bot logs and activity.
 
 Logs are stored in the system directory.
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1824,7 +1886,6 @@ async def callback_admin_restart_bot(callback: types.CallbackQuery):
     if callback.from_user.id != OWNER_ID:
         await callback.answer("❌ Owner only!", show_alert=True)
         return
-    
     text = """
 ╔═══════════════════════╗
     🔄 <b>RESTART BOT</b> 🔄
@@ -1840,11 +1901,9 @@ Users may experience brief downtime.
 
 Use <code>/restart</code> to confirm.
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
@@ -1853,29 +1912,22 @@ async def cmd_add_admin(message: types.Message):
     if message.from_user.id not in admin_ids:
         await message.answer("❌ Permission denied!")
         return
-    
     try:
         args = message.text.split()
         if len(args) != 2:
             await message.answer("Usage: /addadmin USER_ID")
             return
-        
         new_admin_id = int(args[1])
-        
         if new_admin_id in admin_ids:
             await message.answer(f"✅ User {new_admin_id} is already an admin!")
             return
-        
         admin_ids.add(new_admin_id)
-        
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (new_admin_id,))
         conn.commit()
         conn.close()
-        
         await message.answer(f"✅ User <code>{new_admin_id}</code> added as admin!", parse_mode="HTML")
-        
     except ValueError:
         await message.answer("❌ Invalid USER_ID!")
     except Exception as e:
@@ -1887,33 +1939,25 @@ async def cmd_remove_admin(message: types.Message):
     if message.from_user.id != OWNER_ID:
         await message.answer("❌ Only owner can remove admins!")
         return
-    
     try:
         args = message.text.split()
         if len(args) != 2:
             await message.answer("Usage: /removeadmin USER_ID")
             return
-        
         remove_admin_id = int(args[1])
-        
         if remove_admin_id == OWNER_ID:
             await message.answer("❌ Cannot remove owner!")
             return
-        
         if remove_admin_id not in admin_ids:
             await message.answer(f"❌ User {remove_admin_id} is not an admin!")
             return
-        
         admin_ids.remove(remove_admin_id)
-        
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         c.execute('DELETE FROM admins WHERE user_id = ?', (remove_admin_id,))
         conn.commit()
         conn.close()
-        
         await message.answer(f"✅ User <code>{remove_admin_id}</code> removed from admins!", parse_mode="HTML")
-        
     except ValueError:
         await message.answer("❌ Invalid USER_ID!")
     except Exception as e:
@@ -1925,30 +1969,24 @@ async def cmd_add_premium(message: types.Message):
     if message.from_user.id not in admin_ids:
         await message.answer("❌ Permission denied!")
         return
-    
     try:
         args = message.text.split()
         if len(args) != 3:
             await message.answer("Usage: /addpremium USER_ID DAYS")
             return
-        
         user_id = int(args[1])
         days = int(args[2])
-        
         if days <= 0:
             await message.answer("❌ Days must be greater than 0!")
             return
-        
         expiry = datetime.now() + timedelta(days=days)
         user_subscriptions[user_id] = {'expiry': expiry}
-        
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         c.execute('INSERT OR REPLACE INTO subscriptions (user_id, expiry) VALUES (?, ?)',
                   (user_id, expiry.isoformat()))
         conn.commit()
         conn.close()
-        
         await message.answer(
             f"✅ <b>Premium Added!</b>\n\n"
             f"User: <code>{user_id}</code>\n"
@@ -1956,7 +1994,6 @@ async def cmd_add_premium(message: types.Message):
             f"Expires: {expiry.strftime('%Y-%m-%d %H:%M')}",
             parse_mode="HTML"
         )
-        
     except ValueError:
         await message.answer("❌ Invalid input!")
     except Exception as e:
@@ -1968,31 +2005,24 @@ async def cmd_ban_user(message: types.Message):
     if message.from_user.id not in admin_ids:
         await message.answer("❌ Permission denied!")
         return
-    
     try:
         args = message.text.split(maxsplit=2)
         if len(args) < 2:
             await message.answer("Usage: /ban USER_ID [REASON]")
             return
-        
         ban_user_id = int(args[1])
         reason = args[2] if len(args) > 2 else "No reason provided"
-        
         if ban_user_id in admin_ids:
             await message.answer("❌ Cannot ban an admin!")
             return
-        
         banned_users.add(ban_user_id)
-        
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         c.execute('INSERT OR REPLACE INTO banned_users (user_id, banned_date, reason) VALUES (?, ?, ?)',
                   (ban_user_id, datetime.now().isoformat(), reason))
         conn.commit()
         conn.close()
-        
         await message.answer(f"🚫 User <code>{ban_user_id}</code> has been banned!\n\nReason: {reason}", parse_mode="HTML")
-        
     except ValueError:
         await message.answer("❌ Invalid USER_ID!")
     except Exception as e:
@@ -2004,29 +2034,22 @@ async def cmd_unban_user(message: types.Message):
     if message.from_user.id not in admin_ids:
         await message.answer("❌ Permission denied!")
         return
-    
     try:
         args = message.text.split()
         if len(args) != 2:
             await message.answer("Usage: /unban USER_ID")
             return
-        
         unban_user_id = int(args[1])
-        
         if unban_user_id not in banned_users:
             await message.answer(f"❌ User {unban_user_id} is not banned!")
             return
-        
         banned_users.remove(unban_user_id)
-        
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         c.execute('DELETE FROM banned_users WHERE user_id = ?', (unban_user_id,))
         conn.commit()
         conn.close()
-        
         await message.answer(f"✅ User <code>{unban_user_id}</code> has been unbanned!", parse_mode="HTML")
-        
     except ValueError:
         await message.answer("❌ Invalid USER_ID!")
     except Exception as e:
@@ -2038,23 +2061,17 @@ async def cmd_broadcast(message: types.Message):
     if message.from_user.id not in admin_ids:
         await message.answer("❌ Permission denied!")
         return
-    
     try:
         broadcast_text = message.text.replace("/broadcast", "", 1).strip()
-        
         if not broadcast_text:
             await message.answer("Usage: /broadcast Your message here")
             return
-        
         sent_count = 0
         failed_count = 0
-        
         status_msg = await message.answer(f"📢 Broadcasting to {len(active_users)} users...")
-        
         for user_id in active_users:
             if user_id in banned_users:
                 continue
-            
             try:
                 await bot.send_message(user_id, f"📢 <b>Announcement:</b>\n\n{broadcast_text}", parse_mode="HTML")
                 sent_count += 1
@@ -2062,14 +2079,12 @@ async def cmd_broadcast(message: types.Message):
             except Exception as e:
                 logger.error(f"Failed to send to {user_id}: {e}")
                 failed_count += 1
-        
         await status_msg.edit_text(
             f"✅ <b>Broadcast Complete!</b>\n\n"
             f"✅ Sent: {sent_count}\n"
             f"❌ Failed: {failed_count}",
             parse_mode="HTML"
         )
-        
     except Exception as e:
         logger.error(f"Error broadcasting: {e}")
         await message.answer(f"❌ Error: {str(e)}")
@@ -2077,30 +2092,22 @@ async def cmd_broadcast(message: types.Message):
 @dp.message(Command("search"))
 async def cmd_search_files(message: types.Message):
     user_id = message.from_user.id
-    
     try:
         args = message.text.split(maxsplit=1)
         if len(args) < 2:
             await message.answer("Usage: /search filename")
             return
-        
         search_term = args[1].lower()
         user_file_list = user_files.get(user_id, [])
-        
         matches = [f for f in user_file_list if search_term in f[0].lower()]
-        
         if not matches:
             await message.answer(f"🔍 No files found matching '<code>{search_term}</code>'", parse_mode="HTML")
             return
-        
         text = f"🔍 <b>Search Results ({len(matches)}):</b>\n\n"
-        
         for file_name, file_type in matches:
             icon = "🐍" if file_type == "py" else "🟨" if file_type == "js" else "📦"
             text += f"{icon} <code>{file_name}</code>\n"
-        
         await message.answer(text, parse_mode="HTML")
-        
     except Exception as e:
         logger.error(f"Search error: {e}")
         await message.answer(f"❌ Error: {str(e)}")
@@ -2117,7 +2124,7 @@ async def cmd_help(message: types.Message):
 1️⃣ <b>Upload Files:</b>
    • Click 'Upload File'
    • Send your .py, .js, or .zip file
-   • File will be saved automatically
+   • ⚡ Costs 1 credit per upload
 
 2️⃣ <b>Run Scripts:</b>
    • Go to 'My Files'
@@ -2140,16 +2147,13 @@ async def cmd_help(message: types.Message):
 /help - Show this help
 /search - Search files
 /stats - Your statistics
-/premium - Free info
 
 <b>Need help? Contact owner! 💬</b>
 """
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎯 Features", callback_data="all_features")],
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
     ])
-    
     await message.answer(text, reply_markup=back_keyboard, parse_mode="HTML")
 
 @dp.message(Command("stats"))
@@ -2157,7 +2161,7 @@ async def cmd_stats(message: types.Message):
     user_id = message.from_user.id
     user_file_count = len(user_files.get(user_id, []))
     user_fav_count = len(user_favorites.get(user_id, []))
-    is_premium = user_id in user_subscriptions and user_subscriptions[user_id]['expiry'] > datetime.now()
+    credits = get_user_credits(user_id)   # [CREDIT]
     
     text = f"""
 ╔═══════════════════════╗
@@ -2168,6 +2172,7 @@ async def cmd_stats(message: types.Message):
 
 🆔 User ID: <code>{user_id}</code>
 👤 Name: {message.from_user.full_name}
+💳 Credits: {credits}
 📦 Files Uploaded: {user_file_count} (Unlimited ♾️)
 ⭐ Favorites: {user_fav_count}
 💎 Account: Free 🆓 (Unlimited ♾️)
@@ -2182,16 +2187,13 @@ async def cmd_stats(message: types.Message):
 
 {'✅ Bot Status: Active' if not bot_locked else '🔒 Bot: Maintenance'}
 """
-    
     if user_id in admin_ids:
         text += f"\n━━━━━━━━━━━━━━━━━━━━\n👑 <b>ADMIN STATS:</b>\n"
         text += f"👥 Total Users: {len(active_users)}\n"
         text += f"📁 Total Files: {sum(len(files) for files in user_files.values())}\n"
-    
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
     ])
-    
     await message.answer(text, reply_markup=back_keyboard, parse_mode="HTML")
 
 
@@ -2205,7 +2207,7 @@ _BOT_USERNAME = None
 
 def _auth_ok(request):
     if not ADMIN_PASSWORD:
-        return True  # password set nahi hai to panel open rahega
+        return True
     h = request.headers.get('Authorization', '')
     if not h.startswith('Basic '):
         return False
@@ -2243,7 +2245,8 @@ def _collect():
             users.append({'id': uid, 'joined': (jd or '-')[:16].replace('T', ' '), 'last': (la or '-')[:16].replace('T', ' '),
                           'files': len(user_files.get(uid, [])), 'banned': uid in banned_users, 'admin': uid in admin_ids,
                           'sub': uid in user_subscriptions and user_subscriptions[uid]['expiry'] > now,
-                          'running': sum(1 for r in running if r['owner'] == uid)})
+                          'running': sum(1 for r in running if r['owner'] == uid),
+                          'credits': get_user_credits(uid)})  # [CREDIT] expose credits to panel
         conn.close()
     except Exception as e:
         logger.error(f"Panel user fetch error: {e}")
@@ -2328,7 +2331,7 @@ async def panel_action(request):
     except Exception:
         return web.json_response({'ok': False, 'msg': 'Invalid data'}, status=400)
 
-    if act in ('ban', 'unban', 'stop_user') and uid is None:
+    if act in ('ban', 'unban', 'stop_user', 'add_credit', 'deduct_credit') and uid is None:
         return web.json_response({'ok': False, 'msg': 'User ID chahiye'})
     if act == 'ban':
         if uid in admin_ids:
@@ -2361,6 +2364,19 @@ async def panel_action(request):
             return web.json_response({'ok': False, 'msg': 'Message khali ya bahut lamba hai'})
         asyncio.create_task(_broadcast(text))
         return web.json_response({'ok': True, 'msg': f'Broadcast shuru: {len(active_users)} users ko'})
+    # [CREDIT] web panel credit actions
+    if act == 'add_credit':
+        amt = int(d.get('amount') or 0)
+        if amt <= 0:
+            return web.json_response({'ok': False, 'msg': 'Amount positive hona chahiye'})
+        nv = add_user_credits(uid, amt)
+        return web.json_response({'ok': True, 'msg': f'{uid}: +{amt} credits (ab {nv})'})
+    if act == 'deduct_credit':
+        amt = int(d.get('amount') or 0)
+        if amt <= 0:
+            return web.json_response({'ok': False, 'msg': 'Amount positive hona chahiye'})
+        nv = deduct_user_credits(uid, amt)
+        return web.json_response({'ok': True, 'msg': f'{uid}: -{amt} credits (ab {nv})'})
     return web.json_response({'ok': False, 'msg': 'Unknown action'})
 
 async def panel_api(request):
@@ -2420,11 +2436,12 @@ h=`<div class="grid">${card('👥 Total Members',D.total_users)}${card('🆕 New
 <h3>🤖 Abhi chal rahe bots</h3>`+bots()}
 if(P=='bots')h=bots();
 if(P=='files')h=`<input placeholder="🔍 File ya user ID search..." value="${esc(Q)}" oninput="Q=this.value;render()" style="margin-bottom:10px"><div class="box wrap"><table><tr><th>User</th><th>File</th><th>Type</th><th>Status</th></tr>`+(D.files_list.filter(f=>(f.name+f.owner).toLowerCase().includes(Q.toLowerCase())).map(f=>`<tr><td>${f.owner}</td><td>${esc(f.name)}</td><td>${esc(f.type)}</td><td><span class="tag ${f.on?'t-on':'t-off'}">${f.on?'Running':'Stopped'}</span></td></tr>`).join('')||'<tr><td colspan=4>Koi file nahi</td></tr>')+`</table></div>`;
-if(P=='users')h=`<input placeholder="🔍 User ID search..." value="${esc(Q)}" oninput="Q=this.value;render()" style="margin-bottom:10px"><div class="box wrap"><table><tr><th>User ID</th><th>Joined</th><th>Last active</th><th>Files</th><th>Run</th><th>Tags</th><th></th></tr>`+(D.users.filter(u=>String(u.id).includes(Q)).map(u=>`<tr><td>${u.id}</td><td>${esc(u.joined)}</td><td>${esc(u.last)}</td><td>${u.files}</td><td>${u.running}</td><td>${u.banned?'🚫':''}${u.admin?'👑':''}</td><td>${u.banned?`<button class="a g" onclick="act({action:'unban',user_id:${u.id}})">Unban</button>`:`<button class="a r" onclick="act({action:'ban',user_id:${u.id}})">Ban</button>`} <button class="a" onclick="act({action:'stop_user',user_id:${u.id}})">Stop bots</button></td></tr>`).join('')||'<tr><td colspan=7>Koi user nahi</td></tr>')+`</table></div>`;
+if(P=='users')h=`<input placeholder="🔍 User ID search..." value="${esc(Q)}" oninput="Q=this.value;render()" style="margin-bottom:10px"><div class="box wrap"><table><tr><th>User ID</th><th>Joined</th><th>Last active</th><th>Files</th><th>Credits</th><th>Run</th><th>Tags</th><th></th></tr>`+(D.users.filter(u=>String(u.id).includes(Q)).map(u=>`<tr><td>${u.id}</td><td>${esc(u.joined)}</td><td>${esc(u.last)}</td><td>${u.files}</td><td>${u.credits}</td><td>${u.running}</td><td>${u.banned?'🚫':''}${u.admin?'👑':''}</td><td>${u.banned?`<button class="a g" onclick="act({action:'unban',user_id:${u.id}})">Unban</button>`:`<button class="a r" onclick="act({action:'ban',user_id:${u.id}})">Ban</button>`} <button class="a" onclick="act({action:'stop_user',user_id:${u.id}})">Stop bots</button> <button class="a g" onclick="credAct('add_credit',${u.id})">+Credit</button> <button class="a r" onclick="credAct('deduct_credit',${u.id})">-Credit</button></td></tr>`).join('')||'<tr><td colspan=8>Koi user nahi</td></tr>')+`</table></div>`;
 if(P=='cast')h=`<div class="box"><b>📢 Saare users ko message</b><textarea id="bc" rows="5" placeholder="Message likho..." style="margin:10px 0"></textarea><button class="a b" onclick="cast()">Send to all users</button></div>`;
 if(P=='set')h=`<div class="box"><b>Bot control</b><div class="row" style="margin-top:10px"><button class="a b" onclick="act({action:'lock'})">🔒 Lock / Unlock bot</button><button class="a r" onclick="if(confirm('Saare bots stop karein?'))act({action:'stop_all'})">🛑 Stop ALL bots</button></div></div><div class="box"><b>Manual ban / unban</b><div class="row" style="margin-top:10px"><input id="uid" placeholder="User ID" inputmode="numeric"><button class="a r" onclick="m('ban')">Ban</button><button class="a g" onclick="m('unban')">Unban</button></div></div>`;
 $('view').innerHTML=h;const i=document.querySelector('#view input[oninput]');if(i&&Q){i.focus();i.setSelectionRange(Q.length,Q.length)}}
 function m(a){const u=$('uid').value.trim();if(!u)return toast('User ID daalo',false);act({action:a,user_id:u})}
+function credAct(a,uid){const n=prompt('Kitne credits?');if(!n)return;act({action:a,user_id:uid,amount:n})}
 function cast(){const t=$('bc').value.trim();if(!t)return toast('Message likho',false);if(confirm('Sabko bhejein?')){act({action:'broadcast',text:t});$('bc').value=''}}
 async function load(){try{D=await (await fetch('/admin/api')).json();const a=document.activeElement;if(a&&(a.tagName=='TEXTAREA'||a.id=='uid'))return;render()}catch(e){$('st').textContent='Load error'}}
 load();setInterval(load,15000);
@@ -2493,7 +2510,6 @@ async def landing_page(request):
     return web.Response(text=page, content_type='text/html')
 
 async def keep_alive():
-    """Render free service ko sone se bachane ke liye khud ko ping karta hai"""
     url = os.getenv('RENDER_EXTERNAL_URL')
     if not url:
         return
@@ -2505,20 +2521,17 @@ async def keep_alive():
                     logger.info(f"Keep-alive ping: {r.status}")
         except Exception as e:
             logger.warning(f"Keep-alive failed: {e}")
-        await asyncio.sleep(600)  # har 10 minute
+        await asyncio.sleep(600)
 
 async def web_server():
     app = web.Application()
-    
     async def health(request):
         return web.Response(text="ok")
-    
     app.router.add_get('/', landing_page)
     app.router.add_get('/health', health)
     app.router.add_get('/admin', admin_page)
     app.router.add_get('/admin/api', panel_api)
     app.router.add_post('/admin/action', panel_action)
-    
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv('PORT', 5000))
@@ -2528,10 +2541,8 @@ async def web_server():
 
 async def main():
     logger.info("🚀 Starting Advanced File Host Bot...")
-    
     asyncio.create_task(web_server())
     asyncio.create_task(keep_alive())
-    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
