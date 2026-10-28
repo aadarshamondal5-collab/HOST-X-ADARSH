@@ -12,7 +12,7 @@ import json
 import zipfile
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+from aiogram.filters import Command, BaseFilter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
@@ -25,11 +25,14 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv('BOT_TOKEN')
-OWNER_ID_STR = os.getenv('OWNER_ID')
-ADMIN_ID_STR = os.getenv('ADMIN_ID')
-YOUR_USERNAME = os.getenv('YOUR_USERNAME')
-UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL')
+# ─────────────────────────────────────────────
+# ENV CONFIG (falls back to original credentials)
+# ─────────────────────────────────────────────
+TOKEN = os.getenv('BOT_TOKEN', '9275055517:AAGq3k8oIks9GhopFi2_9aqiKJ1i54WlTzQ')
+OWNER_ID_STR = os.getenv('OWNER_ID', '8763167054')
+ADMIN_ID_STR = os.getenv('ADMIN_ID', '8763167054')
+YOUR_USERNAME = os.getenv('YOUR_USERNAME', '@invalid_adarsh')
+UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'https://t.me/devolperaadarsha')
 
 if not TOKEN:
     logger.error("BOT_TOKEN not found in environment variables!")
@@ -72,27 +75,33 @@ bot_scripts = {}
 user_subscriptions = {}
 user_files = {}
 user_favorites = {}
-user_credits = {}            # [CREDIT]
-pending_credit_action = {}   # [CREDIT]  {admin_id: {'action':'add'|'deduct', 'step':'await_id'|'await_amt', 'target_id': int|None}}
+user_credits = {}
+pending_credit_action = {}
 banned_users = set()
 active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
 bot_locked = False
 bot_stats = {'total_uploads': 0, 'total_downloads': 0, 'total_runs': 0}
 
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'adarsha2009')
+
+
+# ─────────────────────────────────────────────
+# DATABASE
+# ─────────────────────────────────────────────
 def migrate_db():
     logger.info("Running database migrations...")
     try:
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
-        
+
         c.execute("PRAGMA table_info(user_files)")
         columns = [row[1] for row in c.fetchall()]
         if 'upload_date' not in columns:
             logger.info("Adding upload_date column to user_files table...")
             c.execute('ALTER TABLE user_files ADD COLUMN upload_date TEXT')
             logger.info("upload_date column added successfully.")
-        
+
         c.execute("PRAGMA table_info(active_users)")
         columns = [row[1] for row in c.fetchall()]
         if 'join_date' not in columns:
@@ -104,15 +113,15 @@ def migrate_db():
             c.execute('ALTER TABLE active_users ADD COLUMN last_active TEXT')
             logger.info("last_active column added successfully.")
 
-        # [CREDIT] ensure credits table exists
         c.execute('''CREATE TABLE IF NOT EXISTS credits
                      (user_id INTEGER PRIMARY KEY, credits INTEGER NOT NULL DEFAULT 0)''')
-        
+
         conn.commit()
         conn.close()
         logger.info("Database migrations completed successfully.")
     except Exception as e:
         logger.error(f"Database migration error: {e}", exc_info=True)
+
 
 def init_db():
     logger.info(f"Initializing database at: {DATABASE_PATH}")
@@ -134,78 +143,74 @@ def init_db():
                      (user_id INTEGER, file_name TEXT, PRIMARY KEY (user_id, file_name))''')
         c.execute('''CREATE TABLE IF NOT EXISTS bot_stats
                      (stat_name TEXT PRIMARY KEY, stat_value INTEGER)''')
-        # [CREDIT]
         c.execute('''CREATE TABLE IF NOT EXISTS credits
                      (user_id INTEGER PRIMARY KEY, credits INTEGER NOT NULL DEFAULT 0)''')
-        
+
         c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
         if ADMIN_ID != OWNER_ID:
             c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (ADMIN_ID,))
-        
+
         for stat in ['total_uploads', 'total_downloads', 'total_runs']:
             c.execute('INSERT OR IGNORE INTO bot_stats (stat_name, stat_value) VALUES (?, 0)', (stat,))
-        
+
         conn.commit()
         conn.close()
         logger.info("Database initialized successfully.")
     except Exception as e:
         logger.error(f"Database initialization error: {e}", exc_info=True)
 
+
 def load_data():
     logger.info("Loading data from database...")
     try:
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
-        
+
         c.execute('SELECT user_id, expiry FROM subscriptions')
         for user_id, expiry in c.fetchall():
             try:
                 user_subscriptions[user_id] = {'expiry': datetime.fromisoformat(expiry)}
             except ValueError:
                 logger.warning(f"Invalid expiry date for user {user_id}")
-        
+
         c.execute('SELECT user_id, file_name, file_type FROM user_files')
         for user_id, file_name, file_type in c.fetchall():
             if user_id not in user_files:
                 user_files[user_id] = []
             user_files[user_id].append((file_name, file_type))
-        
+
         c.execute('SELECT user_id FROM active_users')
         active_users.update(user_id for (user_id,) in c.fetchall())
-        
+
         c.execute('SELECT user_id FROM admins')
         admin_ids.update(user_id for (user_id,) in c.fetchall())
-        
+
         c.execute('SELECT user_id FROM banned_users')
         banned_users.update(user_id for (user_id,) in c.fetchall())
-        
+
         c.execute('SELECT user_id, file_name FROM favorites')
         for user_id, file_name in c.fetchall():
             if user_id not in user_favorites:
                 user_favorites[user_id] = []
             user_favorites[user_id].append(file_name)
-        
+
         c.execute('SELECT stat_name, stat_value FROM bot_stats')
         for stat_name, stat_value in c.fetchall():
             bot_stats[stat_name] = stat_value
-        
-        # [CREDIT] load credits
+
         c.execute('SELECT user_id, credits FROM credits')
         for user_id, credits in c.fetchall():
             user_credits[user_id] = credits
-        
+
         conn.close()
         logger.info(f"Data loaded: {len(active_users)} users, {len(banned_users)} banned, {len(admin_ids)} admins.")
     except Exception as e:
         logger.error(f"Error loading data: {e}", exc_info=True)
 
-init_db()
-migrate_db()
-load_data()
 
-# [CREDIT] credit helpers
 def get_user_credits(user_id):
     return user_credits.get(user_id, 0)
+
 
 def set_user_credits(user_id, amount):
     amount = max(0, int(amount))
@@ -219,17 +224,27 @@ def set_user_credits(user_id, amount):
     except Exception as e:
         logger.error(f"Error saving credits for {user_id}: {e}")
 
+
 def add_user_credits(user_id, amount):
     new_val = get_user_credits(user_id) + int(amount)
     set_user_credits(user_id, new_val)
     return new_val
+
 
 def deduct_user_credits(user_id, amount):
     new_val = max(0, get_user_credits(user_id) - int(amount))
     set_user_credits(user_id, new_val)
     return new_val
 
-# ── AUTO DEPENDENCY INSTALLER ────────────────────────
+
+init_db()
+migrate_db()
+load_data()
+
+
+# ─────────────────────────────────────────────
+# AUTO DEPENDENCY INSTALLER
+# ─────────────────────────────────────────────
 IMPORT_TO_PIP = {
     'telebot': 'pyTelegramBotAPI',
     'telegram': 'python-telegram-bot',
@@ -260,6 +275,7 @@ STDLIB_MODULES = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_nam
     'signal', 'struct', 'queue', 'multiprocessing', 'abc', 'enum', 'uuid', 'glob'
 }
 
+
 def extract_imports(file_path):
     modules = set()
     try:
@@ -270,6 +286,7 @@ def extract_imports(file_path):
     except Exception as e:
         logger.error(f"Import extraction error: {e}")
     return modules
+
 
 def install_missing_dependencies(file_path, timeout=90):
     modules = extract_imports(file_path)
@@ -294,12 +311,18 @@ def install_missing_dependencies(file_path, timeout=90):
             failed.append(pip_name)
     return installed, failed
 
+
 def get_user_file_limit(user_id):
     return OWNER_LIMIT
+
 
 def format_limit(limit):
     return "Unlimited ♾️" if limit == float('inf') else f"{limit} files"
 
+
+# ─────────────────────────────────────────────
+# KEYBOARDS
+# ─────────────────────────────────────────────
 def get_main_keyboard(user_id):
     if user_id in admin_ids:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -324,11 +347,11 @@ def get_main_keyboard(user_id):
         ])
     return keyboard
 
+
 def get_admin_panel_keyboard():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏱️ Bot Uptime", callback_data="admin_bot_uptime")],
         [InlineKeyboardButton(text="👥 Total Users", callback_data="admin_total_users_simple")],
-        # [CREDIT] new admin buttons
         [InlineKeyboardButton(text="💰 Add Credit", callback_data="admin_add_credit")],
         [InlineKeyboardButton(text="💸 Deduct Credit", callback_data="admin_deduct_credit")],
         [InlineKeyboardButton(text="📝 Logs", callback_data="admin_view_logs")],
@@ -336,8 +359,8 @@ def get_admin_panel_keyboard():
     ])
     return keyboard
 
+
 def build_welcome_text(user_id: int, full_name: str) -> str:
-    # [CREDIT] show credits
     credits = get_user_credits(user_id)
     return f"""╔═══════════════════════╗
     🚀 <b>TEAM X HOSTBOT</b> 🚀
@@ -370,35 +393,62 @@ def build_welcome_text(user_id: int, full_name: str) -> str:
 ⚡ <b>Developed by</b> Adarsha (Team X)
 🔒 <b>Version:</b> 2.1"""
 
+
+# ─────────────────────────────────────────────
+# CREDIT FLOW FILTER (fixes .py upload bug)
+# ─────────────────────────────────────────────
+class HasPendingCredit(BaseFilter):
+    async def __call__(self, message: types.Message) -> bool:
+        return (
+            message.from_user is not None
+            and message.from_user.id in pending_credit_action
+        )
+
+
+# ─────────────────────────────────────────────
+# COMMANDS
+# ─────────────────────────────────────────────
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
-    
+
     if user_id in banned_users:
         await message.answer("🚫 <b>You are banned from using this bot!</b>\n\nContact admin for more info.", parse_mode="HTML")
         return
-    
+
     active_users.add(user_id)
 
-    # [CREDIT] ensure credits row exists (new users start at 0)
     if user_id not in user_credits:
         set_user_credits(user_id, 0)
-    
+
     try:
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         now = datetime.now().isoformat()
-        c.execute('INSERT OR IGNORE INTO active_users (user_id, join_date, last_active) VALUES (?, ?, ?)', 
+        c.execute('INSERT OR IGNORE INTO active_users (user_id, join_date, last_active) VALUES (?, ?, ?)',
                   (user_id, now, now))
         c.execute('UPDATE active_users SET last_active = ? WHERE user_id = ?', (now, user_id))
         conn.commit()
         conn.close()
     except Exception as e:
         logger.error(f"Error saving active user: {e}")
-    
+
     welcome_text = build_welcome_text(user_id, message.from_user.full_name)
     await message.answer(welcome_text, reply_markup=get_main_keyboard(user_id), parse_mode="HTML")
 
+
+@dp.message(Command("cancel"))
+async def cmd_cancel_credit(message: types.Message):
+    if message.from_user.id in pending_credit_action:
+        del pending_credit_action[message.from_user.id]
+        await message.answer("✅ Cancelled.", reply_markup=get_main_keyboard(message.from_user.id))
+    else:
+        await message.answer("Nothing to cancel.")
+
+
+# ─────────────────────────────────────────────
+# CALLBACKS — MAIN MENU
+# ─────────────────────────────────────────────
 @dp.callback_query(F.data == "back_to_main")
 async def callback_back_to_main(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -417,17 +467,18 @@ Use buttons below to navigate 👇
     await callback.message.edit_text(welcome_text, reply_markup=get_main_keyboard(user_id), parse_mode="HTML")
     await callback.answer()
 
+
 @dp.callback_query(F.data == "upload_file")
 async def callback_upload_file(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    
+
     if bot_locked and user_id not in admin_ids:
         await callback.answer("🔒 Bot is locked for maintenance!", show_alert=True)
         return
-    
+
     current_files = len(user_files.get(user_id, []))
     limit = get_user_file_limit(user_id)
-    credits = get_user_credits(user_id)   # [CREDIT]
+    credits = get_user_credits(user_id)
 
     upload_text = f"""
 ╔═══════════════════════╗
@@ -452,19 +503,20 @@ async def callback_upload_file(callback: types.CallbackQuery):
 
 🔥 <b>Quick &amp; Easy!</b>
 """
-    
+
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
     ])
-    
+
     await callback.message.edit_text(upload_text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
+
 
 @dp.callback_query(F.data == "check_files")
 async def callback_check_files(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     files = user_files.get(user_id, [])
-    
+
     if not files:
         text = """
 ╔═══════════════════════╗
@@ -502,15 +554,16 @@ Upload your first file to get started! 🚀
             ])
         buttons.append([InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")])
         back_keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    
+
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
+
 
 @dp.callback_query(F.data == "my_favorites")
 async def callback_my_favorites(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     favorites = user_favorites.get(user_id, [])
-    
+
     if not favorites:
         text = """
 ╔═══════════════════════╗
@@ -537,16 +590,17 @@ Add files to favorites for quick access! 🚀
                 InlineKeyboardButton(text=f"❌", callback_data=f"toggle_fav:{file_name}")
             ])
         buttons.append([InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")])
-    
+
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
+
 
 @dp.callback_query(F.data == "search_files")
 async def callback_search_files(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     files = user_files.get(user_id, [])
-    
+
     text = f"""
 ╔═══════════════════════╗
     🔍 <b>SEARCH FILES</b> 🔍
@@ -563,7 +617,7 @@ async def callback_search_files(callback: types.CallbackQuery):
 To search, use:
 <code>/search filename</code>
 """
-    
+
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📁 View All Files", callback_data="check_files")],
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
@@ -571,13 +625,14 @@ To search, use:
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
+
 @dp.callback_query(F.data == "bot_speed")
 async def callback_bot_speed(callback: types.CallbackQuery):
     start_time = datetime.now()
     await callback.answer("⚡ Testing...")
     end_time = datetime.now()
     speed = (end_time - start_time).total_seconds() * 1000
-    
+
     if speed < 100:
         status = "🟢 Excellent"
         emoji = "🚀"
@@ -587,7 +642,7 @@ async def callback_bot_speed(callback: types.CallbackQuery):
     else:
         status = "🔴 Slow"
         emoji = "🐌"
-    
+
     text = f"""
 ╔═══════════════════════╗
     ⚡ <b>SPEED TEST</b> ⚡
@@ -603,20 +658,21 @@ async def callback_bot_speed(callback: types.CallbackQuery):
 
 ✨ Bot is running smoothly!
 """
-    
+
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Test Again", callback_data="bot_speed"),
          InlineKeyboardButton(text="🏠 Home", callback_data="back_to_main")]
     ])
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
 
+
 @dp.callback_query(F.data == "statistics")
 async def callback_statistics(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     user_file_count = len(user_files.get(user_id, []))
     user_fav_count = len(user_favorites.get(user_id, []))
-    credits = get_user_credits(user_id)   # [CREDIT]
-    
+    credits = get_user_credits(user_id)
+
     text = f"""
 ╔═══════════════════════╗
     📊 <b>YOUR STATISTICS</b> 📊
@@ -643,17 +699,18 @@ async def callback_statistics(callback: types.CallbackQuery):
 
 {'✅ Bot Status: Active' if not bot_locked else '🔒 Bot: Maintenance'}
 """
-    
+
     if user_id in admin_ids:
         text += f"\n━━━━━━━━━━━━━━━━━━━━\n👑 <b>ADMIN STATS:</b>\n"
         text += f"👥 Total Users: {len(active_users)}\n"
         text += f"📁 Total Files: {sum(len(files) for files in user_files.values())}\n"
-    
+
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
     ])
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
+
 
 @dp.callback_query(F.data == "help_info")
 async def callback_help_info(callback: types.CallbackQuery):
@@ -701,6 +758,7 @@ async def callback_help_info(callback: types.CallbackQuery):
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
+
 @dp.callback_query(F.data == "all_features")
 async def callback_all_features(callback: types.CallbackQuery):
     text = """
@@ -737,6 +795,7 @@ async def callback_all_features(callback: types.CallbackQuery):
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
+
 @dp.callback_query(F.data == "get_premium")
 async def callback_get_premium(callback: types.CallbackQuery):
     text = """
@@ -758,6 +817,10 @@ Help chahiye? Owner se contact karo 💬
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
+
+# ─────────────────────────────────────────────
+# ADMIN PANEL
+# ─────────────────────────────────────────────
 @dp.callback_query(F.data == "admin_panel")
 async def callback_admin_panel(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -774,7 +837,7 @@ Select an option below 👇
     await callback.message.edit_text(text, reply_markup=get_admin_panel_keyboard(), parse_mode="HTML")
     await callback.answer()
 
-# [CREDIT] ADD CREDIT handler
+
 @dp.callback_query(F.data == "admin_add_credit")
 async def callback_admin_add_credit(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
@@ -797,7 +860,7 @@ Type /cancel to abort."""
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
-# [CREDIT] DEDUCT CREDIT handler
+
 @dp.callback_query(F.data == "admin_deduct_credit")
 async def callback_admin_deduct_credit(callback: types.CallbackQuery):
     if callback.from_user.id not in admin_ids:
@@ -820,96 +883,6 @@ Type /cancel to abort."""
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
-# [CREDIT] cancel pending flow
-@dp.message(Command("cancel"))
-async def cmd_cancel_credit(message: types.Message):
-    if message.from_user.id in pending_credit_action:
-        del pending_credit_action[message.from_user.id]
-        await message.answer("✅ Cancelled.", reply_markup=get_main_keyboard(message.from_user.id))
-    else:
-        await message.answer("Nothing to cancel.")
-
-# [CREDIT] multi-step credit flow — registered LAST so it only catches fallback
-@dp.message()
-async def credit_flow_handler(message: types.Message):
-    admin_id = message.from_user.id
-    if admin_id not in pending_credit_action:
-        return
-    if admin_id not in admin_ids:
-        pending_credit_action.pop(admin_id, None)
-        return
-    if not message.text:
-        return
-
-    text = message.text.strip()
-
-    if text.lower() in ('/cancel', 'cancel'):
-        pending_credit_action.pop(admin_id, None)
-        await message.answer("✅ Cancelled.", reply_markup=get_main_keyboard(admin_id))
-        return
-
-    if text.startswith('/'):
-        return
-
-    state = pending_credit_action[admin_id]
-
-    if state['step'] == 'await_id':
-        if not text.isdigit():
-            await message.answer("❌ Invalid User ID. Please send a numeric Telegram user ID.")
-            return
-        target_id = int(text)
-        state['target_id'] = target_id
-        state['step'] = 'await_amt'
-        pending_credit_action[admin_id] = state
-        current = get_user_credits(target_id)
-        verb = "add to" if state['action'] == 'add' else "deduct from"
-        await message.answer(
-            f"👤 Target User: <code>{target_id}</code>\n"
-            f"💳 Current Credits: <b>{current}</b>\n\n"
-            f"How many credits to <b>{verb}</b> this user?\n"
-            f"Send a number. Type /cancel to abort.",
-            parse_mode="HTML"
-        )
-        return
-
-    if state['step'] == 'await_amt':
-        if not text.isdigit() or int(text) <= 0:
-            await message.answer("❌ Please send a positive whole number.")
-            return
-        amount = int(text)
-        target_id = state['target_id']
-
-        if state['action'] == 'add':
-            new_val = add_user_credits(target_id, amount)
-            verb = "Added"
-            symbol = "➕"
-        else:
-            new_val = deduct_user_credits(target_id, amount)
-            verb = "Deducted"
-            symbol = "➖"
-
-        pending_credit_action.pop(admin_id, None)
-
-        try:
-            await bot.send_message(
-                target_id,
-                f"{symbol} <b>Credits Updated</b>\n\n"
-                f"{verb}: <b>{amount}</b>\n"
-                f"💳 New Balance: <b>{new_val}</b>",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-        await message.answer(
-            f"✅ <b>Done!</b>\n\n"
-            f"👤 User: <code>{target_id}</code>\n"
-            f"{symbol} {verb}: <b>{amount}</b>\n"
-            f"💳 New Balance: <b>{new_val}</b>",
-            reply_markup=get_main_keyboard(admin_id),
-            parse_mode="HTML"
-        )
-        return
 
 @dp.callback_query(F.data == "admin_bot_uptime")
 async def callback_admin_bot_uptime(callback: types.CallbackQuery):
@@ -934,6 +907,7 @@ async def callback_admin_bot_uptime(callback: types.CallbackQuery):
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
+
 @dp.callback_query(F.data == "admin_total_users_simple")
 async def callback_admin_total_users_simple(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -954,18 +928,49 @@ async def callback_admin_total_users_simple(callback: types.CallbackQuery):
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
+
+@dp.callback_query(F.data == "admin_view_logs")
+async def callback_admin_view_logs(callback: types.CallbackQuery):
+    if callback.from_user.id not in admin_ids:
+        await callback.answer("❌ Admin only!", show_alert=True)
+        return
+    text = """
+╔═══════════════════════╗
+    📝 <b>SYSTEM LOGS</b> 📝
+╚═══════════════════════╝
+
+View bot logs and activity.
+
+<b>Available Logs:</b>
+• Error logs
+• User activity
+• Script executions
+• Admin actions
+
+Logs are stored in the system directory.
+"""
+    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
+    ])
+    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
+    await callback.answer()
+
+
+# ─────────────────────────────────────────────
+# FAVORITES / INFO / DELETE / RUN
+# ─────────────────────────────────────────────
 @dp.callback_query(F.data.startswith("toggle_fav:"))
 async def callback_toggle_favorite(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     file_name = callback.data.split(":", 1)[1]
-    
+
     if user_id not in user_favorites:
         user_favorites[user_id] = []
-    
+
     try:
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
-        
+
         if file_name in user_favorites[user_id]:
             user_favorites[user_id].remove(file_name)
             c.execute('DELETE FROM favorites WHERE user_id = ? AND file_name = ?', (user_id, file_name))
@@ -974,7 +979,7 @@ async def callback_toggle_favorite(callback: types.CallbackQuery):
             user_favorites[user_id].append(file_name)
             c.execute('INSERT OR IGNORE INTO favorites (user_id, file_name) VALUES (?, ?)', (user_id, file_name))
             await callback.answer("⭐ Added to favorites!", show_alert=True)
-        
+
         conn.commit()
         conn.close()
         await callback_check_files(callback)
@@ -982,23 +987,24 @@ async def callback_toggle_favorite(callback: types.CallbackQuery):
         logger.error(f"Error toggling favorite: {e}")
         await callback.answer(f"❌ Error: {str(e)}", show_alert=True)
 
+
 @dp.callback_query(F.data.startswith("file_info:"))
 async def callback_file_info(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     file_name = callback.data.split(":", 1)[1]
     user_folder = UPLOAD_BOTS_DIR / str(user_id)
     file_path = user_folder / file_name
-    
+
     if not file_path.exists():
         await callback.answer("❌ File not found!", show_alert=True)
         return
-    
+
     file_size = file_path.stat().st_size
     file_size_mb = file_size / (1024 * 1024)
     file_ext = file_path.suffix
     modified_time = datetime.fromtimestamp(file_path.stat().st_mtime)
     is_favorite = file_name in user_favorites.get(user_id, [])
-    
+
     text = f"""
 ╔═══════════════════════╗
     ℹ️ <b>FILE INFO</b> ℹ️
@@ -1022,27 +1028,57 @@ async def callback_file_info(callback: types.CallbackQuery):
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
 
+
+@dp.callback_query(F.data.startswith("delete_file:"))
+async def callback_delete_file(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    file_name = callback.data.split(":", 1)[1]
+    user_folder = UPLOAD_BOTS_DIR / str(user_id)
+    file_path = user_folder / file_name
+    try:
+        if file_path.exists():
+            file_path.unlink()
+        if user_id in user_files:
+            user_files[user_id] = [f for f in user_files[user_id] if f[0] != file_name]
+        if file_name in user_favorites.get(user_id, []):
+            user_favorites[user_id].remove(file_name)
+        conn = sqlite3.connect(DATABASE_PATH)
+        c = conn.cursor()
+        c.execute('DELETE FROM user_files WHERE user_id = ? AND file_name = ?', (user_id, file_name))
+        c.execute('DELETE FROM favorites WHERE user_id = ? AND file_name = ?', (user_id, file_name))
+        conn.commit()
+        conn.close()
+        await callback.answer("✅ File deleted successfully!", show_alert=True)
+        await callback_check_files(callback)
+    except Exception as e:
+        logger.error(f"Error deleting file: {e}")
+        await callback.answer(f"❌ Error: {str(e)}", show_alert=True)
+
+
+# ─────────────────────────────────────────────
+# DOCUMENT UPLOAD (with credit check)
+# ─────────────────────────────────────────────
 @dp.message(F.document)
 async def handle_document(message: types.Message):
     user_id = message.from_user.id
-    
+    logger.info(f"[DOC-HIT] user={user_id} file={message.document.file_name}")
+
     if user_id in banned_users:
         await message.answer("🚫 You are banned from using this bot!")
         return
-    
+
     if bot_locked and user_id not in admin_ids:
         await message.answer("🔒 Bot is currently locked!")
         return
-    
+
     document = message.document
     file_name = document.file_name
     file_ext = os.path.splitext(file_name)[1].lower()
-    
+
     if file_ext not in ['.py', '.js', '.zip']:
         await message.answer("❌ Only .py, .js, and .zip files are supported!")
         return
 
-    # [CREDIT] must have at least 1 credit (admins exempt)
     credits = get_user_credits(user_id)
     if credits <= 0 and user_id not in admin_ids:
         await message.answer(
@@ -1053,21 +1089,21 @@ async def handle_document(message: types.Message):
             parse_mode="HTML"
         )
         return
-    
+
     current_files = len(user_files.get(user_id, []))
     limit = get_user_file_limit(user_id)
-    
+
     if current_files >= limit:
         await message.answer(f"❌ Upload limit reached! ({current_files}/{limit})")
         return
-    
+
     user_folder = UPLOAD_BOTS_DIR / str(user_id)
     user_folder.mkdir(exist_ok=True)
     file_path = user_folder / file_name
-    
+
     try:
         file_size_kb = document.file_size / 1024
-        
+
         status_msg = await message.answer(
             f"📤 <b>Preparing upload...</b>\n\n"
             f"📄 File: <code>{file_name}</code>\n"
@@ -1075,7 +1111,7 @@ async def handle_document(message: types.Message):
             f"▓░░░░░░░░░ 0%",
             parse_mode="HTML"
         )
-        
+
         await asyncio.sleep(0.3)
         await status_msg.edit_text(
             f"📥 <b>Downloading...</b>\n\n"
@@ -1084,9 +1120,9 @@ async def handle_document(message: types.Message):
             f"▓▓▓░░░░░░░ 30%",
             parse_mode="HTML"
         )
-        
+
         await bot.download(document, destination=file_path)
-        
+
         await status_msg.edit_text(
             f"💾 <b>Saving to database...</b>\n\n"
             f"📄 File: <code>{file_name}</code>\n"
@@ -1094,12 +1130,12 @@ async def handle_document(message: types.Message):
             f"▓▓▓▓▓▓▓░░░ 70%",
             parse_mode="HTML"
         )
-        
+
         if user_id not in user_files:
             user_files[user_id] = []
-        
+
         user_files[user_id].append((file_name, file_ext[1:]))
-        
+
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         now = datetime.now().isoformat()
@@ -1108,13 +1144,12 @@ async def handle_document(message: types.Message):
         c.execute('UPDATE bot_stats SET stat_value = stat_value + 1 WHERE stat_name = ?', ('total_uploads',))
         conn.commit()
         conn.close()
-        
+
         bot_stats['total_uploads'] = bot_stats.get('total_uploads', 0) + 1
 
-        # [CREDIT] deduct 1 credit after successful upload (admins exempt)
         if user_id not in admin_ids:
             deduct_user_credits(user_id, 1)
-        
+
         await status_msg.edit_text(
             f"✅ <b>Finalizing...</b>\n\n"
             f"📄 File: <code>{file_name}</code>\n"
@@ -1122,9 +1157,9 @@ async def handle_document(message: types.Message):
             f"▓▓▓▓▓▓▓▓▓▓ 100%",
             parse_mode="HTML"
         )
-        
+
         await asyncio.sleep(0.5)
-        
+
         if file_ext == '.zip':
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📦 Extract ZIP", callback_data=f"extract_zip:{file_name}"),
@@ -1143,8 +1178,7 @@ async def handle_document(message: types.Message):
                 [InlineKeyboardButton(text="📁 My Files", callback_data="check_files"),
                  InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
             ])
-        
-        # [CREDIT] show new balance in success message
+
         new_credits = get_user_credits(user_id)
         await status_msg.edit_text(
             f"""
@@ -1167,30 +1201,34 @@ async def handle_document(message: types.Message):
         logger.error(f"Error uploading file: {e}")
         await message.answer(f"❌ Upload failed: {str(e)}")
 
+
+# ─────────────────────────────────────────────
+# RUN / STOP / LOG
+# ─────────────────────────────────────────────
 @dp.callback_query(F.data.startswith("run_script:"))
 async def callback_run_script(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     file_name = callback.data.split(":", 1)[1]
-    
+
     user_folder = UPLOAD_BOTS_DIR / str(user_id)
     file_path = user_folder / file_name
-    
+
     if not file_path.exists():
         await callback.answer("❌ File not found!", show_alert=True)
         return
-    
+
     script_key = f"{user_id}_{file_name}"
-    
+
     if script_key in bot_scripts:
         await callback.answer("⚠️ Script is already running!", show_alert=True)
         return
-    
+
     file_ext = file_path.suffix.lower()
-    
+
     try:
         log_file_path = user_folder / f"{file_path.stem}.log"
         log_file = open(log_file_path, 'w')
-        
+
         if file_ext == '.py':
             status_msg = await callback.message.answer("📦 <i>Checking dependencies...</i>", parse_mode="HTML")
             installed, failed = install_missing_dependencies(file_path)
@@ -1220,7 +1258,7 @@ async def callback_run_script(callback: types.CallbackQuery):
             log_file.close()
             await callback.answer("❌ Cannot run this file type!", show_alert=True)
             return
-        
+
         bot_scripts[script_key] = {
             'process': process,
             'file_name': file_name,
@@ -1230,19 +1268,19 @@ async def callback_run_script(callback: types.CallbackQuery):
             'type': file_ext[1:],
             'log_file': log_file
         }
-        
+
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         c.execute('UPDATE bot_stats SET stat_value = stat_value + 1 WHERE stat_name = ?', ('total_runs',))
         conn.commit()
         conn.close()
         bot_stats['total_runs'] = bot_stats.get('total_runs', 0) + 1
-        
+
         try:
             await callback.answer(f"✅ Script started! (PID: {process.pid})", show_alert=True)
         except Exception:
             await callback.message.answer(f"✅ Script started! (PID: {process.pid})")
-        
+
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🛑 Stop Script", callback_data=f"stop_script:{script_key}")],
             [InlineKeyboardButton(text="📋 View Output", callback_data=f"view_log:{file_name}")],
@@ -1253,6 +1291,7 @@ async def callback_run_script(callback: types.CallbackQuery):
     except Exception as e:
         logger.error(f"Error running script: {e}")
         await callback.answer(f"❌ Error: {str(e)}", show_alert=True)
+
 
 @dp.callback_query(F.data.startswith("view_log:"))
 async def callback_view_log(callback: types.CallbackQuery):
@@ -1293,6 +1332,7 @@ async def callback_view_log(callback: types.CallbackQuery):
     except Exception as e:
         await callback.answer(f"❌ Log read error: {str(e)}", show_alert=True)
 
+
 @dp.callback_query(F.data.startswith("stop_script:"))
 async def callback_stop_script(callback: types.CallbackQuery):
     script_key = callback.data.split(":", 1)[1]
@@ -1320,6 +1360,10 @@ async def callback_stop_script(callback: types.CallbackQuery):
         logger.error(f"Error stopping script: {e}")
         await callback.answer(f"❌ Error: {str(e)}", show_alert=True)
 
+
+# ─────────────────────────────────────────────
+# ZIP EXTRACT
+# ─────────────────────────────────────────────
 @dp.callback_query(F.data.startswith("extract_zip:"))
 async def callback_extract_zip(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -1423,490 +1467,10 @@ Please wait...
         logger.error(f"Error extracting ZIP: {e}")
         await callback.answer(f"❌ Extraction failed: {str(e)}", show_alert=True)
 
-@dp.callback_query(F.data.startswith("delete_file:"))
-async def callback_delete_file(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    file_name = callback.data.split(":", 1)[1]
-    user_folder = UPLOAD_BOTS_DIR / str(user_id)
-    file_path = user_folder / file_name
-    try:
-        if file_path.exists():
-            file_path.unlink()
-        if user_id in user_files:
-            user_files[user_id] = [f for f in user_files[user_id] if f[0] != file_name]
-        if file_name in user_favorites.get(user_id, []):
-            user_favorites[user_id].remove(file_name)
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        c.execute('DELETE FROM user_files WHERE user_id = ? AND file_name = ?', (user_id, file_name))
-        c.execute('DELETE FROM favorites WHERE user_id = ? AND file_name = ?', (user_id, file_name))
-        conn.commit()
-        conn.close()
-        await callback.answer("✅ File deleted successfully!", show_alert=True)
-        await callback_check_files(callback)
-    except Exception as e:
-        logger.error(f"Error deleting file: {e}")
-        await callback.answer(f"❌ Error: {str(e)}", show_alert=True)
 
-@dp.callback_query(F.data == "admin_total_users")
-async def callback_admin_total_users(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    user_list = "\n".join([f"• <code>{uid}</code>" for uid in list(active_users)[:15]])
-    text = f"""
-╔═══════════════════════╗
-    👥 <b>USER STATISTICS</b> 👥
-╚═══════════════════════╝
-
-📊 <b>Total Users:</b> {len(active_users)}
-🚫 <b>Banned:</b> {len(banned_users)}
-✅ <b>Active:</b> {len(active_users) - len(banned_users)}
-
-<b>📝 Recent Users (15):</b>
-{user_list}
-
-{'...' if len(active_users) > 15 else ''}
-"""
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_total_files")
-async def callback_admin_total_files(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    total_files = sum(len(files) for files in user_files.values())
-    py_files = sum(1 for files in user_files.values() for f in files if f[1] == 'py')
-    js_files = sum(1 for files in user_files.values() for f in files if f[1] == 'js')
-    zip_files = sum(1 for files in user_files.values() for f in files if f[1] == 'zip')
-    text = f"""
-╔═══════════════════════╗
-    📁 <b>FILE STATISTICS</b> 📁
-╚═══════════════════════╝
-
-📊 <b>Total Files:</b> {total_files}
-
-<b>📦 By Type:</b>
-🐍 Python: {py_files}
-🟨 JavaScript: {js_files}
-📦 ZIP: {zip_files}
-
-<b>📈 Top Users:</b>
-"""
-    top_users = sorted(user_files.items(), key=lambda x: len(x[1]), reverse=True)[:5]
-    for user_id, files in top_users:
-        text += f"• User <code>{user_id}</code>: {len(files)} files\n"
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_running_scripts")
-async def callback_admin_running_scripts(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    if not bot_scripts:
-        text = """
-╔═══════════════════════╗
-    🚀 <b>RUNNING SCRIPTS</b> 🚀
-╚═══════════════════════╝
-
-💤 No scripts running currently
-"""
-        buttons = []
-    else:
-        text = f"""
-╔═══════════════════════╗
-    🚀 <b>RUNNING ({len(bot_scripts)})</b> 🚀
-╚═══════════════════════╝
-
-"""
-        buttons = []
-        for script_key, info in bot_scripts.items():
-            runtime = (datetime.now() - info['start_time']).total_seconds()
-            text += f"🔸 <code>{info['file_name']}</code>\n"
-            text += f"   PID: {info['process'].pid} | User: {info['script_owner_id']}\n"
-            text += f"   Runtime: {int(runtime)}s\n\n"
-            buttons.append([InlineKeyboardButton(
-                text=f"🛑 Stop {info['file_name'][:15]}", 
-                callback_data=f"stop_script:{script_key}"
-            )])
-    buttons.append([InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")])
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_premium_users")
-async def callback_admin_premium_users(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    premium_users = [(u, data) for u, data in user_subscriptions.items() if data['expiry'] > datetime.now()]
-    if not premium_users:
-        text = """
-╔═══════════════════════╗
-    💎 <b>PREMIUM USERS</b> 💎
-╚═══════════════════════╝
-
-No active premium subscriptions.
-"""
-    else:
-        text = f"""
-╔═══════════════════════╗
-    💎 <b>PREMIUM ({len(premium_users)})</b> 💎
-╚═══════════════════════╝
-
-"""
-        for user_id, data in premium_users:
-            expiry_date = data['expiry'].strftime('%Y-%m-%d')
-            text += f"💎 User <code>{user_id}</code>\n   Expires: {expiry_date}\n\n"
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Add Premium", callback_data="add_premium")],
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_analytics")
-async def callback_admin_analytics(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    text = f"""
-╔═══════════════════════╗
-    📊 <b>BOT ANALYTICS</b> 📊
-╚═══════════════════════╝
-
-<b>📈 GLOBAL STATS:</b>
-
-📤 Total Uploads: {bot_stats.get('total_uploads', 0)}
-📥 Total Downloads: {bot_stats.get('total_downloads', 0)}
-▶️ Script Runs: {bot_stats.get('total_runs', 0)}
-👥 Total Users: {len(active_users)}
-📁 Total Files: {sum(len(files) for files in user_files.values())}
-🚀 Running Now: {len(bot_scripts)}
-⭐ Total Favorites: {sum(len(favs) for favs in user_favorites.values())}
-
-<b>💎 PREMIUM:</b>
-Active: {len([u for u in user_subscriptions if user_subscriptions[u]['expiry'] > datetime.now()])}
-Expired: {len([u for u in user_subscriptions if user_subscriptions[u]['expiry'] <= datetime.now()])}
-
-<b>🛡️ SECURITY:</b>
-Banned Users: {len(banned_users)}
-Admins: {len(admin_ids)}
-Bot Status: {'🔒 Locked' if bot_locked else '✅ Active'}
-"""
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_system_status")
-async def callback_admin_system_status(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    cpu = psutil.cpu_percent(interval=1)
-    memory = psutil.virtual_memory()
-    disk = psutil.disk_usage('/')
-    text = f"""
-╔═══════════════════════╗
-    ⚙️ <b>SYSTEM STATUS</b> ⚙️
-╚═══════════════════════╝
-
-<b>💻 CPU:</b>
-Usage: {cpu}%
-{'🟢 Normal' if cpu < 70 else '🟡 High' if cpu < 90 else '🔴 Critical'}
-
-<b>🧠 MEMORY:</b>
-Used: {memory.percent}%
-Free: {memory.available / (1024**3):.1f} GB
-Total: {memory.total / (1024**3):.1f} GB
-
-<b>💾 DISK:</b>
-Used: {disk.percent}%
-Free: {disk.free / (1024**3):.1f} GB
-Total: {disk.total / (1024**3):.1f} GB
-
-<b>🤖 BOT STATUS:</b>
-Status: {'🔒 Locked' if bot_locked else '✅ Running'}
-Scripts: {len(bot_scripts)} active
-Uptime: ✅ Online
-"""
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Refresh", callback_data="admin_system_status")],
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_add_admin")
-async def callback_admin_add_admin(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    text = """
-╔═══════════════════════╗
-    ➕ <b>ADD ADMIN</b> ➕
-╚═══════════════════════╝
-
-To add a new admin, use:
-<code>/addadmin USER_ID</code>
-
-<b>Example:</b>
-<code>/addadmin 123456789</code>
-
-The user will get full admin privileges!
-"""
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_remove_admin")
-async def callback_admin_remove_admin(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    text = f"""
-╔═══════════════════════╗
-    ➖ <b>REMOVE ADMIN</b> ➖
-╚═══════════════════════╝
-
-<b>Current Admins ({len(admin_ids)}):</b>
-
-"""
-    for admin_id in admin_ids:
-        text += f"👑 <code>{admin_id}</code>\n"
-    text += "\n<b>To remove:</b>\n<code>/removeadmin USER_ID</code>"
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_ban_user")
-async def callback_admin_ban_user(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    text = f"""
-╔═══════════════════════╗
-    🚫 <b>BAN USER</b> 🚫
-╚═══════════════════════╝
-
-<b>Currently Banned:</b> {len(banned_users)} users
-
-To ban a user, use:
-<code>/ban USER_ID REASON</code>
-
-<b>Example:</b>
-<code>/ban 123456789 Spam</code>
-
-Banned users cannot use the bot!
-"""
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_unban_user")
-async def callback_admin_unban_user(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    text = f"""
-╔═══════════════════════╗
-    ✅ <b>UNBAN USER</b> ✅
-╚═══════════════════════╝
-
-<b>Banned Users:</b> {len(banned_users)}
-
-"""
-    if banned_users:
-        text += "<b>List:</b>\n"
-        for ban_id in list(banned_users)[:10]:
-            text += f"🚫 <code>{ban_id}</code>\n"
-    text += "\n<b>To unban:</b>\n<code>/unban USER_ID</code>"
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "lock_bot")
-async def callback_lock_bot(callback: types.CallbackQuery):
-    global bot_locked
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    bot_locked = not bot_locked
-    status = "🔒 LOCKED" if bot_locked else "🔓 UNLOCKED"
-    await callback.answer(f"Bot is now {status}!", show_alert=True)
-    await callback_admin_panel(callback)
-
-@dp.callback_query(F.data == "broadcast")
-async def callback_broadcast(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    text = f"""
-╔═══════════════════════╗
-    📢 <b>BROADCAST</b> 📢
-╚═══════════════════════╝
-
-Send a message to all users!
-
-<b>Total Recipients:</b> {len(active_users)}
-
-<b>Command:</b>
-<code>/broadcast Your message here</code>
-
-⚠️ Use this feature responsibly!
-"""
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "add_premium")
-async def callback_add_premium(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    text = """
-╔═══════════════════════╗
-    💎 <b>ADD PREMIUM</b> 💎
-╚═══════════════════════╝
-
-Give premium access to users!
-
-<b>Command:</b>
-<code>/addpremium USER_ID DAYS</code>
-
-<b>Examples:</b>
-<code>/addpremium 123456789 30</code> (30 days)
-<code>/addpremium 987654321 7</code> (7 days)
-"""
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_clean_files")
-async def callback_admin_clean_files(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    text = """
-╔═══════════════════════╗
-    🗑️ <b>CLEAN FILES</b> 🗑️
-╚═══════════════════════╝
-
-Clean old or unused files from the system.
-
-<b>Options:</b>
-• Delete files older than 30 days
-• Remove files from banned users
-• Clean temp/log files
-
-<b>Command:</b>
-<code>/clean OPTION</code>
-
-⚠️ This action cannot be undone!
-"""
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_backup_db")
-async def callback_admin_backup_db(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    try:
-        backup_path = IROTECH_DIR / f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        conn = sqlite3.connect(DATABASE_PATH)
-        backup_conn = sqlite3.connect(backup_path)
-        conn.backup(backup_conn)
-        backup_conn.close()
-        conn.close()
-        await callback.answer("✅ Database backed up!", show_alert=True)
-        await callback.message.answer_document(
-            FSInputFile(backup_path),
-            caption="💾 <b>Database Backup</b>\n\nCreated: " + datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            parse_mode="HTML"
-        )
-        backup_path.unlink()
-    except Exception as e:
-        logger.error(f"Backup error: {e}")
-        await callback.answer(f"❌ Backup failed: {str(e)}", show_alert=True)
-
-@dp.callback_query(F.data == "admin_view_logs")
-async def callback_admin_view_logs(callback: types.CallbackQuery):
-    if callback.from_user.id not in admin_ids:
-        await callback.answer("❌ Admin only!", show_alert=True)
-        return
-    text = """
-╔═══════════════════════╗
-    📝 <b>SYSTEM LOGS</b> 📝
-╚═══════════════════════╝
-
-View bot logs and activity.
-
-<b>Available Logs:</b>
-• Error logs
-• User activity
-• Script executions
-• Admin actions
-
-Logs are stored in the system directory.
-"""
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_restart_bot")
-async def callback_admin_restart_bot(callback: types.CallbackQuery):
-    if callback.from_user.id != OWNER_ID:
-        await callback.answer("❌ Owner only!", show_alert=True)
-        return
-    text = """
-╔═══════════════════════╗
-    🔄 <b>RESTART BOT</b> 🔄
-╚═══════════════════════╝
-
-⚠️ <b>WARNING:</b>
-This will restart the entire bot!
-
-All running scripts will be stopped.
-Users may experience brief downtime.
-
-<b>Only use if necessary!</b>
-
-Use <code>/restart</code> to confirm.
-"""
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]
-    ])
-    await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
-    await callback.answer()
-
+# ─────────────────────────────────────────────
+# ADMIN COMMANDS
+# ─────────────────────────────────────────────
 @dp.message(Command("addadmin"))
 async def cmd_add_admin(message: types.Message):
     if message.from_user.id not in admin_ids:
@@ -1933,6 +1497,7 @@ async def cmd_add_admin(message: types.Message):
     except Exception as e:
         logger.error(f"Error adding admin: {e}")
         await message.answer(f"❌ Error: {str(e)}")
+
 
 @dp.message(Command("removeadmin"))
 async def cmd_remove_admin(message: types.Message):
@@ -1963,6 +1528,7 @@ async def cmd_remove_admin(message: types.Message):
     except Exception as e:
         logger.error(f"Error removing admin: {e}")
         await message.answer(f"❌ Error: {str(e)}")
+
 
 @dp.message(Command("addpremium"))
 async def cmd_add_premium(message: types.Message):
@@ -2000,6 +1566,7 @@ async def cmd_add_premium(message: types.Message):
         logger.error(f"Error adding premium: {e}")
         await message.answer(f"❌ Error: {str(e)}")
 
+
 @dp.message(Command("ban"))
 async def cmd_ban_user(message: types.Message):
     if message.from_user.id not in admin_ids:
@@ -2029,6 +1596,7 @@ async def cmd_ban_user(message: types.Message):
         logger.error(f"Error banning user: {e}")
         await message.answer(f"❌ Error: {str(e)}")
 
+
 @dp.message(Command("unban"))
 async def cmd_unban_user(message: types.Message):
     if message.from_user.id not in admin_ids:
@@ -2055,6 +1623,7 @@ async def cmd_unban_user(message: types.Message):
     except Exception as e:
         logger.error(f"Error unbanning user: {e}")
         await message.answer(f"❌ Error: {str(e)}")
+
 
 @dp.message(Command("broadcast"))
 async def cmd_broadcast(message: types.Message):
@@ -2089,6 +1658,7 @@ async def cmd_broadcast(message: types.Message):
         logger.error(f"Error broadcasting: {e}")
         await message.answer(f"❌ Error: {str(e)}")
 
+
 @dp.message(Command("search"))
 async def cmd_search_files(message: types.Message):
     user_id = message.from_user.id
@@ -2111,6 +1681,7 @@ async def cmd_search_files(message: types.Message):
     except Exception as e:
         logger.error(f"Search error: {e}")
         await message.answer(f"❌ Error: {str(e)}")
+
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
@@ -2156,13 +1727,14 @@ async def cmd_help(message: types.Message):
     ])
     await message.answer(text, reply_markup=back_keyboard, parse_mode="HTML")
 
+
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
     user_id = message.from_user.id
     user_file_count = len(user_files.get(user_id, []))
     user_fav_count = len(user_favorites.get(user_id, []))
-    credits = get_user_credits(user_id)   # [CREDIT]
-    
+    credits = get_user_credits(user_id)
+
     text = f"""
 ╔═══════════════════════╗
     📊 <b>YOUR STATISTICS</b> 📊
@@ -2197,13 +1769,98 @@ async def cmd_stats(message: types.Message):
     await message.answer(text, reply_markup=back_keyboard, parse_mode="HTML")
 
 
-# ── WEBSITE: LANDING PAGE + ADMIN PANEL ──────────────
+# ─────────────────────────────────────────────
+# CREDIT FLOW (filtered — never swallows documents)
+# ─────────────────────────────────────────────
+@dp.message(HasPendingCredit())
+async def credit_flow_handler(message: types.Message):
+    admin_id = message.from_user.id
+    if admin_id not in admin_ids:
+        pending_credit_action.pop(admin_id, None)
+        return
+    if not message.text:
+        return
+
+    text = message.text.strip()
+
+    if text.lower() in ('/cancel', 'cancel'):
+        pending_credit_action.pop(admin_id, None)
+        await message.answer("✅ Cancelled.", reply_markup=get_main_keyboard(admin_id))
+        return
+
+    if text.startswith('/'):
+        return
+
+    state = pending_credit_action[admin_id]
+
+    if state['step'] == 'await_id':
+        if not text.isdigit():
+            await message.answer("❌ Invalid User ID. Please send a numeric Telegram user ID.")
+            return
+        target_id = int(text)
+        state['target_id'] = target_id
+        state['step'] = 'await_amt'
+        pending_credit_action[admin_id] = state
+        current = get_user_credits(target_id)
+        verb = "add to" if state['action'] == 'add' else "deduct from"
+        await message.answer(
+            f"👤 Target User: <code>{target_id}</code>\n"
+            f"💳 Current Credits: <b>{current}</b>\n\n"
+            f"How many credits to <b>{verb}</b> this user?\n"
+            f"Send a number. Type /cancel to abort.",
+            parse_mode="HTML"
+        )
+        return
+
+    if state['step'] == 'await_amt':
+        if not text.isdigit() or int(text) <= 0:
+            await message.answer("❌ Please send a positive whole number.")
+            return
+        amount = int(text)
+        target_id = state['target_id']
+
+        if state['action'] == 'add':
+            new_val = add_user_credits(target_id, amount)
+            verb = "Added"
+            symbol = "➕"
+        else:
+            new_val = deduct_user_credits(target_id, amount)
+            verb = "Deducted"
+            symbol = "➖"
+
+        pending_credit_action.pop(admin_id, None)
+
+        try:
+            await bot.send_message(
+                target_id,
+                f"{symbol} <b>Credits Updated</b>\n\n"
+                f"{verb}: <b>{amount}</b>\n"
+                f"💳 New Balance: <b>{new_val}</b>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+        await message.answer(
+            f"✅ <b>Done!</b>\n\n"
+            f"👤 User: <code>{target_id}</code>\n"
+            f"{symbol} {verb}: <b>{amount}</b>\n"
+            f"💳 New Balance: <b>{new_val}</b>",
+            reply_markup=get_main_keyboard(admin_id),
+            parse_mode="HTML"
+        )
+        return
+
+
+# ─────────────────────────────────────────────
+# WEB PANEL
+# ─────────────────────────────────────────────
 import base64
 import hmac
 import html as html_lib
 
-ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', '')
 _BOT_USERNAME = None
+
 
 def _auth_ok(request):
     if not ADMIN_PASSWORD:
@@ -2217,10 +1874,12 @@ def _auth_ok(request):
         return False
     return hmac.compare_digest(pwd.encode(), ADMIN_PASSWORD.encode())
 
+
 def _deny():
     if not ADMIN_PASSWORD:
         return web.Response(text="Panel off hai. Render Environment mein ADMIN_PASSWORD set karo.", status=503)
     return web.Response(status=401, headers={'WWW-Authenticate': 'Basic realm="Admin"'}, text="Login required")
+
 
 def _running_list():
     out = []
@@ -2232,6 +1891,7 @@ def _running_list():
         except Exception:
             pass
     return out
+
 
 def _collect():
     now = datetime.now()
@@ -2246,7 +1906,7 @@ def _collect():
                           'files': len(user_files.get(uid, [])), 'banned': uid in banned_users, 'admin': uid in admin_ids,
                           'sub': uid in user_subscriptions and user_subscriptions[uid]['expiry'] > now,
                           'running': sum(1 for r in running if r['owner'] == uid),
-                          'credits': get_user_credits(uid)})  # [CREDIT] expose credits to panel
+                          'credits': get_user_credits(uid)})
         conn.close()
     except Exception as e:
         logger.error(f"Panel user fetch error: {e}")
@@ -2282,6 +1942,7 @@ def _collect():
             'uptime': f"{up.days}d {up.seconds // 3600}h {(up.seconds % 3600) // 60}m",
             'files_list': [{'owner': u, 'name': f[0], 'type': f[1], 'on': f'{u}_{f[0]}' in bot_scripts and bot_scripts[f'{u}_{f[0]}']['process'].poll() is None} for u, fl in user_files.items() for f in fl][:500], 'ram_mb': ram, 'cpu': psutil.cpu_percent(interval=None), 'running': running, 'users': users, 'types': types, 'top': top, **extra}
 
+
 def _stop_script(key):
     info = bot_scripts.get(key)
     if not info:
@@ -2299,11 +1960,13 @@ def _stop_script(key):
     bot_scripts.pop(key, None)
     return True
 
+
 def _db(sql, params=()):
     conn = sqlite3.connect(DATABASE_PATH)
     conn.execute(sql, params)
     conn.commit()
     conn.close()
+
 
 async def _broadcast(text):
     sent = 0
@@ -2317,6 +1980,7 @@ async def _broadcast(text):
             pass
         await asyncio.sleep(0.06)
     logger.info(f"Broadcast finished: {sent} users")
+
 
 async def panel_action(request):
     global bot_locked
@@ -2364,7 +2028,6 @@ async def panel_action(request):
             return web.json_response({'ok': False, 'msg': 'Message khali ya bahut lamba hai'})
         asyncio.create_task(_broadcast(text))
         return web.json_response({'ok': True, 'msg': f'Broadcast shuru: {len(active_users)} users ko'})
-    # [CREDIT] web panel credit actions
     if act == 'add_credit':
         amt = int(d.get('amount') or 0)
         if amt <= 0:
@@ -2379,10 +2042,12 @@ async def panel_action(request):
         return web.json_response({'ok': True, 'msg': f'{uid}: -{amt} credits (ab {nv})'})
     return web.json_response({'ok': False, 'msg': 'Unknown action'})
 
+
 async def panel_api(request):
     if not _auth_ok(request):
         return _deny()
     return web.json_response(_collect())
+
 
 ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Team X HostBot - Dashboard</title><style>
@@ -2447,10 +2112,12 @@ async function load(){try{D=await (await fetch('/admin/api')).json();const a=doc
 load();setInterval(load,15000);
 </script></body></html>"""
 
+
 async def admin_page(request):
     if not _auth_ok(request):
         return _deny()
     return web.Response(text=ADMIN_HTML, content_type='text/html')
+
 
 LANDING_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Team X HostBot - Free Telegram Bot Hosting</title><meta name="description" content="Python aur Node.js bots ko Telegram se free mein host karo. Unlimited uploads, koi premium nahi.">
@@ -2494,6 +2161,7 @@ footer{text-align:center;color:#6b7785;padding:28px 10px;font-size:13px;border-t
 <section><div class="cta"><h2 style="margin-bottom:8px">Ready to host? 🚀</h2><p style="color:#9aa7b5;margin:0 0 16px">Abhi Telegram pe bot kholo.</p><a class="btn p" href="__BOTLINK__">Open Bot</a></div></section>
 <footer>Developed by <b>Adarsha (Team X)</b><br><a href="__YT__">YouTube</a>&bull;<a href="__CHANNEL__">Telegram Channel</a>&bull;<a href="https://t.me/__OWNER__">Contact</a></footer></body></html>"""
 
+
 async def landing_page(request):
     global _BOT_USERNAME
     if not _BOT_USERNAME:
@@ -2509,6 +2177,7 @@ async def landing_page(request):
             .replace('__FILES__', str(sum(len(f) for f in user_files.values()))))
     return web.Response(text=page, content_type='text/html')
 
+
 async def keep_alive():
     url = os.getenv('RENDER_EXTERNAL_URL')
     if not url:
@@ -2523,15 +2192,19 @@ async def keep_alive():
             logger.warning(f"Keep-alive failed: {e}")
         await asyncio.sleep(600)
 
+
 async def web_server():
     app = web.Application()
+
     async def health(request):
         return web.Response(text="ok")
+
     app.router.add_get('/', landing_page)
     app.router.add_get('/health', health)
     app.router.add_get('/admin', admin_page)
     app.router.add_get('/admin/api', panel_api)
     app.router.add_post('/admin/action', panel_action)
+
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv('PORT', 5000))
@@ -2539,11 +2212,13 @@ async def web_server():
     await site.start()
     logger.info(f"🌐 Web server started on port {port}")
 
+
 async def main():
     logger.info("🚀 Starting Advanced File Host Bot...")
     asyncio.create_task(web_server())
     asyncio.create_task(keep_alive())
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
